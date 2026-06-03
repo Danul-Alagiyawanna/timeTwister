@@ -58,7 +58,14 @@ def default_chrome_options():
 
 
 def create_standard_driver(use_undetected: bool = True) -> Any:
-    """Headless Chrome; tries undetected_chromedriver when use_undetected=True."""
+    """Headless Chrome; tries undetected_chromedriver when use_undetected=True.
+
+    Retries with the detected Chrome version when the chromedriver version
+    mismatch error fires (common on GHA where Chrome auto-updates).
+    Falls back to plain Selenium only when UC is unavailable or fails entirely.
+    """
+    import re as _re
+
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
     from webdriver_manager.chrome import ChromeDriverManager
@@ -70,16 +77,41 @@ def create_standard_driver(use_undetected: bool = True) -> Any:
         try:
             import undetected_chromedriver as uc
 
-            options = uc.ChromeOptions()
-            options.page_load_strategy = "eager"
-            options.add_experimental_option(
+            uc_options = uc.ChromeOptions()
+            uc_options.page_load_strategy = "eager"
+            uc_options.add_experimental_option(
                 "prefs", {"profile.default_content_setting_values": {"popups": 1}}
             )
-            driver = uc.Chrome(options=options, use_subprocess=True)
-        except Exception:
+            try:
+                driver = uc.Chrome(options=uc_options, use_subprocess=True)
+            except Exception as first_err:
+                # Detect Chrome version from error message and retry
+                err_msg = str(first_err)
+                match = _re.search(r"Current browser version is (\d+)", err_msg) or \
+                        _re.search(r"only supports Chrome version (\d+)", err_msg)
+                if match:
+                    major = int(match.group(1))
+                    print(f"[INFO] UC version mismatch; retrying with version_main={major}")
+                    try:
+                        retry_opts = uc.ChromeOptions()
+                        retry_opts.page_load_strategy = "eager"
+                        retry_opts.add_experimental_option(
+                            "prefs", {"profile.default_content_setting_values": {"popups": 1}}
+                        )
+                        driver = uc.Chrome(
+                            options=retry_opts,
+                            use_subprocess=True,
+                            version_main=major,
+                        )
+                    except Exception:
+                        driver = None
+                else:
+                    driver = None
+        except ImportError:
             driver = None
 
     if driver is None:
+        print("[INFO] Falling back to plain Selenium ChromeDriver")
         driver = webdriver.Chrome(
             service=Service(ChromeDriverManager().install()),
             options=chrome_options,
