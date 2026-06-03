@@ -749,24 +749,50 @@ def main_incremental():
     seen_this_run = set()
     section_updates: dict[str, tuple[str, str]] = {}
 
+    # Pre-load all list pages and seed checkpoints for sections that don't have one yet.
+    # This must happen BEFORE the fetch loop so that hitting the article cap on section N
+    # doesn't leave sections N+1…8 without a checkpoint forever.
+    section_entries: dict[str, list[dict]] = {}
+
     try:
+        print("\n[INCREMENTAL] Phase 1 — collecting list pages & seeding missing checkpoints")
+        for cat_name, cat_id in FTLK_LIST_CATEGORIES:
+            section_key = _ftlk_section_key(cat_name, cat_id)
+            entries = get_list_entries_from_page(driver, page_url=f"https://www.ft.lk/{cat_name}/{cat_id}")
+            section_entries[section_key] = entries
+
+            cp_link, _ = get_section_checkpoint(json_filename, section_key)
+            if not cp_link and entries:
+                # No prior checkpoint for this section — seed from the current top article.
+                # Next run will stop here (nothing appears "new" above it yet).
+                head = entries[0]
+                section_updates[section_key] = (head["link"], head.get("title") or "")
+                print(f"[INCREMENTAL] Seeded {section_key}: {head.get('title', '')[:60]}")
+
+        # Write seeds now so even if the fetch phase crashes, checkpoints exist.
+        if section_updates:
+            update_section_checkpoints(json_filename, section_updates)
+            print(f"[INCREMENTAL] Saved {len(section_updates)} seeded checkpoint(s)")
+            section_updates = {}  # reset; fetch phase will overwrite with real newest
+
+        print("\n[INCREMENTAL] Phase 2 — fetching new articles per section")
         for cat_name, cat_id in FTLK_LIST_CATEGORIES:
             section_key = _ftlk_section_key(cat_name, cat_id)
             section_checkpoint_link, section_checkpoint_title = get_section_checkpoint(
                 json_filename, section_key
             )
             if section_checkpoint_link:
-                print(f"[INCREMENTAL] Section checkpoint {section_key}: "
+                print(f"\n[INCREMENTAL] {section_key} checkpoint: "
                       f"{section_checkpoint_title[:50] or section_checkpoint_link[:60]}")
 
-            page_url = f"https://www.ft.lk/{cat_name}/{cat_id}"
-            print(f"\n{'=' * 60}")
-            print(f"[INCREMENTAL] Category: {section_key}")
-            print(f"{'=' * 60}")
-
-            entries = get_list_entries_from_page(driver, page_url)
+            entries = section_entries.get(section_key, [])
             if not entries:
+                print(f"[INCREMENTAL] {section_key} — no entries, skipping")
                 continue
+
+            print(f"\n{'=' * 60}")
+            print(f"[INCREMENTAL] Fetching new articles: {section_key} ({len(entries)} links)")
+            print(f"{'=' * 60}")
 
             section_newest: tuple[str, str] | None = None
 
@@ -826,14 +852,8 @@ def main_incremental():
                 time.sleep(0.5)
 
             if section_newest:
+                # Update section checkpoint to the freshest article we actually fetched
                 section_updates[section_key] = section_newest
-            elif not section_checkpoint_link and entries:
-                # Seed this section's boundary from list head (no new fetches needed)
-                head = entries[0]
-                section_updates[section_key] = (
-                    head["link"],
-                    head.get("title") or "",
-                )
 
             if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
                 break
