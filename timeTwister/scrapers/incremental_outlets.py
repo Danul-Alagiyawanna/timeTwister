@@ -164,6 +164,7 @@ def run_economynext_incremental() -> int:
     )
 
     RSS_FEED = "https://economynext.com/feed/"
+    WP_API = "https://economynext.com/wp-json/wp/v2/posts"
     json_path = data_json_path("economynext_latest_news.json")
 
     checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
@@ -173,69 +174,137 @@ def run_economynext_incremental() -> int:
     if known_previous:
         print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
 
-    print("[INCREMENTAL] EconomyNext — RSS feed (no Selenium/Cloudflare)")
+    print("[INCREMENTAL] EconomyNext — RSS/WP-API (no Selenium/Cloudflare)")
     if bootstrap:
         print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
     else:
         print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
 
-    def _fetch_feed(url: str) -> str | None:
-        _BROWSER_HEADERS = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/rss+xml,application/xml,text/xml,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        # Plain requests first — RSS endpoints are usually CF-exempt
+    _BROWSER_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def _get(url: str, **kw) -> "requests.Response | None":  # type: ignore[name-defined]
+        import requests as _req
         try:
-            import requests as _req
-            r = _req.get(url, timeout=15, allow_redirects=True, headers=_BROWSER_HEADERS)
-            if r.status_code == 200 and len(r.text) > 200:
-                print(f"[INFO] RSS fetched via requests (status 200, {len(r.text)} bytes)")
-                return r.text
-            print(f"[WARN] requests got status {r.status_code} for {url}")
+            r = _req.get(url, timeout=15, allow_redirects=True, headers=_BROWSER_HEADERS, **kw)
+            if r.status_code == 200:
+                return r
+            print(f"[WARN] requests {r.status_code} for {url}")
         except Exception as e:
             print(f"[WARN] requests failed: {e}")
-        # curl_cffi fallback (Chrome TLS fingerprint — bypasses stricter CF rules)
-        try:
-            from curl_cffi import requests as cf_req  # type: ignore
-            r = cf_req.get(url, impersonate="chrome124", timeout=15, headers=_BROWSER_HEADERS)
-            if r.status_code == 200 and len(r.text) > 200:
-                print(f"[INFO] RSS fetched via curl_cffi (status 200, {len(r.text)} bytes)")
-                return r.text
-            print(f"[WARN] curl_cffi got status {r.status_code} for {url}")
-        except Exception as e:
-            print(f"[WARN] curl_cffi failed: {e}")
+        # curl_cffi with multiple profiles
+        for profile in ("chrome124", "safari17_0", "firefox133"):
+            try:
+                from curl_cffi import requests as cf_req  # type: ignore
+                r = cf_req.get(url, impersonate=profile, timeout=15, headers=_BROWSER_HEADERS)
+                if r.status_code == 200:
+                    print(f"[INFO] curl_cffi ({profile}) got 200 for {url}")
+                    return r
+                print(f"[WARN] curl_cffi ({profile}) got {r.status_code}")
+            except Exception as e:
+                print(f"[WARN] curl_cffi ({profile}) failed: {e}")
+                break  # ImportError → no point retrying
         return None
 
-    xml_text = _fetch_feed(RSS_FEED)
-    if not xml_text:
-        print("[ERROR] Could not fetch RSS feed — saving empty list")
+    # --- source 1: RSS feed ---
+    articles_raw: list[dict] = []
+    resp = _get(RSS_FEED)
+    if resp and len(resp.text) > 200:
+        print(f"[INFO] RSS fetched ({len(resp.text)} bytes)")
+        ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
+        try:
+            root = ET.fromstring(resp.text)
+            for item in root.findall(".//item"):
+                link = (item.findtext("link") or "").strip()
+                if not link:
+                    continue
+                title = (item.findtext("title") or "").strip()
+                pub_date = (item.findtext("pubDate") or "").strip()
+                description_html = (item.findtext("description") or "").strip()
+                content_html = (item.findtext("content:encoded", namespaces=ns) or "").strip()
+                date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if pub_date:
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        date_str = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        pass
+                desc_text = ""
+                if description_html:
+                    try:
+                        desc_text = BS(description_html, "html.parser").get_text(separator="\n", strip=True)
+                    except Exception:
+                        desc_text = description_html
+                image_url = ""
+                if content_html:
+                    m = _re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_html)
+                    if m:
+                        image_url = m.group(1)
+                articles_raw.append({"title": title, "link": link, "summary": desc_text,
+                                     "description": desc_text, "date": date_str,
+                                     "image_url": image_url, "date_source": f"RSS: {date_str}"})
+            print(f"[INFO] RSS parsed {len(articles_raw)} items")
+        except ET.ParseError as e:
+            print(f"[WARN] RSS parse error: {e}")
+
+    # --- source 2: WordPress REST API (fallback when RSS blocked) ---
+    if not articles_raw:
+        print("[INFO] RSS unavailable — trying WordPress REST API...")
+        resp = _get(WP_API, params={
+            "per_page": 20,
+            "_fields": "id,title,link,date,excerpt,content,jetpack_featured_media_url",
+        })
+        if resp:
+            try:
+                import json as _json
+                posts = _json.loads(resp.text)
+                for post in posts:
+                    link = post.get("link", "").strip()
+                    if not link:
+                        continue
+                    title = BS(post.get("title", {}).get("rendered", ""), "html.parser").get_text(strip=True)
+                    date_str = post.get("date", "")
+                    if date_str:
+                        # WP returns ISO 8601: 2026-06-03T12:21:24
+                        try:
+                            date_str = datetime.fromisoformat(date_str).strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            pass
+                    else:
+                        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    excerpt_html = post.get("excerpt", {}).get("rendered", "")
+                    desc_text = BS(excerpt_html, "html.parser").get_text(separator="\n", strip=True) if excerpt_html else ""
+                    image_url = post.get("jetpack_featured_media_url", "") or ""
+                    if not image_url:
+                        content_html = post.get("content", {}).get("rendered", "")
+                        m = _re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_html)
+                        if m:
+                            image_url = m.group(1)
+                    articles_raw.append({"title": title, "link": link, "summary": desc_text,
+                                         "description": desc_text, "date": date_str,
+                                         "image_url": image_url, "date_source": f"WP-API: {date_str}"})
+                print(f"[INFO] WP-API returned {len(articles_raw)} posts")
+            except Exception as e:
+                print(f"[WARN] WP-API parse error: {e}")
+
+    if not articles_raw:
+        print("[ERROR] All sources failed — saving empty list")
         save_replace_only(json_path, [])
         return 0
 
-    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as e:
-        print(f"[ERROR] RSS parse error: {e}")
-        save_replace_only(json_path, [])
-        return 0
-
-    items = root.findall(".//item")
-    print(f"[INFO] RSS feed returned {len(items)} items")
-
+    # --- apply checkpoint / dedup / cap ---
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
 
-    for item in items:
-        link = (item.findtext("link") or "").strip()
-        if not link:
-            continue
-
+    for art in articles_raw:
+        link = art["link"]
         norm = normalize_link(link)
 
         if is_last_scraped_article(link, checkpoint_link):
@@ -249,50 +318,13 @@ def run_economynext_incremental() -> int:
         if norm in seen_this_run:
             continue
 
-        title = (item.findtext("title") or "").strip()
-        pub_date = (item.findtext("pubDate") or "").strip()
-        description_html = (item.findtext("description") or "").strip()
-        content_html = (item.findtext("content:encoded", namespaces=ns) or "").strip()
-
-        # Parse RFC 2822 date from RSS
-        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if pub_date:
-            try:
-                dt = parsedate_to_datetime(pub_date)
-                date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
-
-        # Plain text summary from RSS description (may contain HTML)
-        desc_text = ""
-        if description_html:
-            try:
-                desc_text = BS(description_html, "html.parser").get_text(separator="\n", strip=True)
-            except Exception:
-                desc_text = description_html
-
-        # First image from full article content
-        image_url = ""
-        if content_html:
-            m = _re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_html)
-            if m:
-                image_url = m.group(1)
-
-        if not title and not desc_text:
+        if not art.get("title") and not art.get("summary"):
             print(f"[SKIP] Empty row: {link[:80]}")
             continue
 
-        new_articles.append({
-            "title": title,
-            "link": link,
-            "summary": desc_text,
-            "description": desc_text,
-            "date": date_str,
-            "image_url": image_url,
-            "date_source": f"RSS: {date_str}",
-        })
+        new_articles.append(art)
         seen_this_run.add(norm)
-        print(f"[INFO] +Article: {title[:70]}")
+        print(f"[INFO] +Article: {art['title'][:70]}")
 
         if len(new_articles) >= max_articles:
             label = "Bootstrap" if bootstrap else "Run safety"
