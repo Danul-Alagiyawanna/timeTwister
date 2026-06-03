@@ -758,7 +758,7 @@ def main_incremental():
         print("\n[INCREMENTAL] Phase 1 — collecting list pages & seeding missing checkpoints")
         for cat_name, cat_id in FTLK_LIST_CATEGORIES:
             section_key = _ftlk_section_key(cat_name, cat_id)
-            entries = get_list_entries_from_page(driver, page_url=f"https://www.ft.lk/{cat_name}/{cat_id}")
+            entries = get_list_entries_from_page(driver, f"https://www.ft.lk/{cat_name}/{cat_id}")
             section_entries[section_key] = entries
 
             cp_link, _ = get_section_checkpoint(json_filename, section_key)
