@@ -23,8 +23,6 @@ from incremental_links import (
     collect_dailynews_links,
     collect_divaina_breaking_links,
     collect_divaina_main_links,
-    collect_economynext_homepage_links,
-    collect_economynext_list_links,
     collect_lankadeepa_links,
     collect_thamilan_links,
     collect_virakesari_links,
@@ -33,6 +31,7 @@ from incremental_links import (
 from incremental_runner import (
     article_from_content,
     article_from_metadata,
+    data_json_path,
     run_incremental_scraper,
 )
 
@@ -146,130 +145,164 @@ def run_dailymirror_incremental() -> int:
     )
 
 
-def _economynext_extract_from_soup(soup, link: str) -> dict | None:
-    """Extract EconomyNext article fields from a BeautifulSoup object (static HTML)."""
-    from datetime import datetime
-    import json as _json
+def run_economynext_incremental() -> int:
+    """Pure RSS approach — no Selenium, no Cloudflare issues from GHA."""
+    import re as _re
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
 
-    # Title
-    title = ""
-    h1 = soup.find("h1")
-    if h1:
-        title = h1.get_text(strip=True)
-    if not title:
-        og = soup.find("meta", attrs={"property": "og:title"})
-        if og:
-            title = og.get("content", "").strip()
+    from bs4 import BeautifulSoup as BS
 
-    # Date
-    date_published = None
-    date_meta = soup.find("meta", attrs={"property": "article:published_time"})
-    if date_meta and date_meta.get("content"):
-        date_str = date_meta["content"]
-        if "," in date_str:
-            date_part = date_str.split(",", 1)[1].strip()
-            for fmt in ["%A %B %d, %Y", "%A %b %d, %Y"]:
-                try:
-                    date_published = datetime.strptime(date_part, fmt)
-                    break
-                except ValueError:
-                    continue
-    if not date_published:
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = _json.loads(script.string or "")
-                if isinstance(data, dict) and "datePublished" in data:
-                    date_published = datetime.fromisoformat(
-                        data["datePublished"].replace("Z", "").split("+")[0]
-                    )
-                    break
-            except Exception:
-                continue
+    from incremental import (
+        INCREMENTAL_BOOTSTRAP_LIMIT,
+        INCREMENTAL_RUN_LIMIT,
+        get_last_scraped_checkpoint,
+        is_last_scraped_article,
+        load_known_links,
+        normalize_link,
+        save_replace_only,
+    )
 
-    # Image
-    image_url = ""
-    og_img = soup.find("meta", attrs={"property": "og:image"})
-    if og_img:
-        image_url = og_img.get("content", "")
+    RSS_FEED = "https://economynext.com/feed/"
+    json_path = data_json_path("economynext_latest_news.json")
 
-    # Description
-    description = ""
-    main_divs = [
-        d for d in soup.find_all("div", class_="story-page-text-content")
-        if "most-recent-article-text" not in " ".join(d.get("class", []))
-    ] or soup.find_all("div", class_="story-page-text-content")
-    if main_divs:
-        paras = [p.get_text(strip=True) for p in main_divs[0].find_all("p") if p.get_text(strip=True)]
-        description = "\n\n".join(paras) if paras else main_divs[0].get_text(strip=True)
+    checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
+    bootstrap = not checkpoint_link
+    max_articles = INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
+    known_previous = load_known_links(json_path)
+    if known_previous:
+        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
 
-    if not title and not description:
+    print("[INCREMENTAL] EconomyNext — RSS feed (no Selenium/Cloudflare)")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+
+    def _fetch_feed(url: str) -> str | None:
+        _BROWSER_HEADERS = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/rss+xml,application/xml,text/xml,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        # Plain requests first — RSS endpoints are usually CF-exempt
+        try:
+            import requests as _req
+            r = _req.get(url, timeout=15, allow_redirects=True, headers=_BROWSER_HEADERS)
+            if r.status_code == 200 and len(r.text) > 200:
+                print(f"[INFO] RSS fetched via requests (status 200, {len(r.text)} bytes)")
+                return r.text
+            print(f"[WARN] requests got status {r.status_code} for {url}")
+        except Exception as e:
+            print(f"[WARN] requests failed: {e}")
+        # curl_cffi fallback (Chrome TLS fingerprint — bypasses stricter CF rules)
+        try:
+            from curl_cffi import requests as cf_req  # type: ignore
+            r = cf_req.get(url, impersonate="chrome124", timeout=15, headers=_BROWSER_HEADERS)
+            if r.status_code == 200 and len(r.text) > 200:
+                print(f"[INFO] RSS fetched via curl_cffi (status 200, {len(r.text)} bytes)")
+                return r.text
+            print(f"[WARN] curl_cffi got status {r.status_code} for {url}")
+        except Exception as e:
+            print(f"[WARN] curl_cffi failed: {e}")
         return None
 
-    standardized_date = (
-        date_published.strftime("%Y-%m-%d %H:%M:%S")
-        if date_published
-        else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    )
-    return {
-        "title": title,
-        "link": link,
-        "summary": description,
-        "description": description,
-        "date": standardized_date,
-        "image_url": image_url,
-        "date_source": f"Article page: {standardized_date}" if date_published else "Incremental scrape",
-    }
+    xml_text = _fetch_feed(RSS_FEED)
+    if not xml_text:
+        print("[ERROR] Could not fetch RSS feed — saving empty list")
+        save_replace_only(json_path, [])
+        return 0
 
-
-def _economynext_fetch_article(driver, link: str, mod) -> dict | None:
-    """Fetch EconomyNext article: try curl_cffi first (bypasses Cloudflare), fall back to Selenium."""
-    # Try curl_cffi first — works from GHA datacenter IPs
+    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
     try:
-        from curl_cffi import requests as cf_requests  # type: ignore
-        from bs4 import BeautifulSoup as _BS
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        print(f"[ERROR] RSS parse error: {e}")
+        save_replace_only(json_path, [])
+        return 0
 
-        resp = cf_requests.get(link, impersonate="chrome", timeout=30)
-        if resp.status_code in (200, 202, 301, 302):
-            soup = _BS(resp.text, "html.parser")
-            title_tag = soup.find("title") or soup.find("h1")
-            title_text = (title_tag.get_text(strip=True) if title_tag else "").lower()
-            if "just a moment" not in title_text:
-                result = _economynext_extract_from_soup(soup, link)
-                if result and (result.get("title") or result.get("summary")):
-                    print(f"     [curl_cffi] Extracted: {result.get('title', '')[:60]}")
-                    return result
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"     [curl_cffi] Failed: {e}")
+    items = root.findall(".//item")
+    print(f"[INFO] RSS feed returned {len(items)} items")
 
-    # Fall back to Selenium
-    return _fetch_metadata(driver, link, mod)
+    new_articles: list[dict] = []
+    seen_this_run: set[str] = set()
 
+    for item in items:
+        link = (item.findtext("link") or "").strip()
+        if not link:
+            continue
 
-def run_economynext_incremental() -> int:
-    mod = _import_scraper("economynext_selenium_json")
-    pages = [
-        ("homepage", "https://economynext.com/"),
-        ("more-news", "https://economynext.com/more-news/"),
-    ]
+        norm = normalize_link(link)
 
-    def collect(d, url):
-        if "more-news" in url:
-            return collect_economynext_list_links(d, url)
-        return collect_economynext_homepage_links(d, url)
+        if is_last_scraped_article(link, checkpoint_link):
+            print(f"[INCREMENTAL] Reached last scraped article — stopping.\n             {link}")
+            break
 
-    def fetch(d, link):
-        return _economynext_fetch_article(d, link, mod)
+        if norm in known_previous:
+            print(f"[SKIP] Already in previous run: {link[:80]}")
+            continue
 
-    return run_incremental_scraper(
-        outlet_name="EconomyNext",
-        data_filename="economynext_latest_news.json",
-        pages=pages,
-        collect_links=collect,
-        fetch_article=fetch,
-        use_undetected=True,
-    )
+        if norm in seen_this_run:
+            continue
+
+        title = (item.findtext("title") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        description_html = (item.findtext("description") or "").strip()
+        content_html = (item.findtext("content:encoded", namespaces=ns) or "").strip()
+
+        # Parse RFC 2822 date from RSS
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if pub_date:
+            try:
+                dt = parsedate_to_datetime(pub_date)
+                date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+
+        # Plain text summary from RSS description (may contain HTML)
+        desc_text = ""
+        if description_html:
+            try:
+                desc_text = BS(description_html, "html.parser").get_text(separator="\n", strip=True)
+            except Exception:
+                desc_text = description_html
+
+        # First image from full article content
+        image_url = ""
+        if content_html:
+            m = _re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_html)
+            if m:
+                image_url = m.group(1)
+
+        if not title and not desc_text:
+            print(f"[SKIP] Empty row: {link[:80]}")
+            continue
+
+        new_articles.append({
+            "title": title,
+            "link": link,
+            "summary": desc_text,
+            "description": desc_text,
+            "date": date_str,
+            "image_url": image_url,
+            "date_source": f"RSS: {date_str}",
+        })
+        seen_this_run.add(norm)
+        print(f"[INFO] +Article: {title[:70]}")
+
+        if len(new_articles) >= max_articles:
+            label = "Bootstrap" if bootstrap else "Run safety"
+            print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
+            break
+
+    print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
+    save_replace_only(json_path, new_articles)
+    print("[INCREMENTAL] EconomyNext finished.")
+    return len(new_articles)
 
 
 def run_themorning_incremental() -> int:
