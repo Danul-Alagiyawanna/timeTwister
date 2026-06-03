@@ -7,7 +7,7 @@ Stop logic:
      is the stop boundary for the next run.
   2. Scrapers walk the live feed top-to-bottom; call is_last_scraped_article() each step.
   3. When it returns True, halt — we've caught up.
-  4. Safety cap if checkpoint never appears: 40 articles (bootstrap), 15 (normal run).
+  4. Safety cap if checkpoint never appears: 5 articles (bootstrap), 15 (normal run).
   5. After saving, merge_and_save() / save_replace_only() updates the checkpoint.
 
 Usage:
@@ -29,7 +29,7 @@ from typing import Any
 from urllib.parse import urldefrag, urlparse
 
 # Safety caps: stop even if checkpoint URL never appears on the feed
-INCREMENTAL_BOOTSTRAP_LIMIT = 40  # first run (no checkpoint)
+INCREMENTAL_BOOTSTRAP_LIMIT = 5  # first run (no checkpoint)
 INCREMENTAL_RUN_LIMIT = 15  # normal runs (checkpoint exists but missing from lists)
 
 
