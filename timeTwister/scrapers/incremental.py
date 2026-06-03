@@ -7,7 +7,8 @@ Stop logic:
      is the stop boundary for the next run.
   2. Scrapers walk the live feed top-to-bottom; call is_last_scraped_article() each step.
   3. When it returns True, halt — we've caught up.
-  4. After saving, merge_and_save() auto-updates the checkpoint to the new data[0].
+  4. Safety cap if checkpoint never appears: 40 articles (bootstrap), 15 (normal run).
+  5. After saving, merge_and_save() / save_replace_only() updates the checkpoint.
 
 Usage:
   from incremental import (
@@ -26,6 +27,18 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urldefrag, urlparse
+
+# Safety caps: stop even if checkpoint URL never appears on the feed
+INCREMENTAL_BOOTSTRAP_LIMIT = 40  # first run (no checkpoint)
+INCREMENTAL_RUN_LIMIT = 15  # normal runs (checkpoint exists but missing from lists)
+
+
+def incremental_fetch_limit(*, bootstrap: bool) -> int:
+    return INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
+
+
+def reached_incremental_limit(article_count: int, *, bootstrap: bool) -> bool:
+    return article_count >= incremental_fetch_limit(bootstrap=bootstrap)
 
 
 def is_incremental_mode(argv: list[str] | None = None) -> bool:

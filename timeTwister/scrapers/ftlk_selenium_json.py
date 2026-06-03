@@ -14,10 +14,12 @@ import sys
 from datetime import datetime, timedelta
 
 from incremental import (
+    incremental_fetch_limit,
     is_incremental_mode,
     get_last_scraped_checkpoint,
     is_last_scraped_article,
     load_known_links,
+    reached_incremental_limit,
     save_replace_only,
     normalize_link,
 )
@@ -672,11 +674,16 @@ def main_incremental():
     json_filename = _data_json_path()
     checkpoint_link, checkpoint_title = get_last_scraped_checkpoint(json_filename)
     bootstrap = not checkpoint_link
-    bootstrap_limit = 40
+    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
 
     print("[INCREMENTAL] FT.lk — stop when last scraped article is detected")
     if bootstrap:
-        print(f"[INCREMENTAL] No prior data; bootstrap (max {bootstrap_limit} articles)")
+        print(f"[INCREMENTAL] No prior data; bootstrap (max {max_articles} articles)")
+    else:
+        print(
+            f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
+            "(if checkpoint not found on feed)"
+        )
 
     driver = _create_driver(headless=True)
 
@@ -740,13 +747,14 @@ def main_incremental():
                 })
                 seen_this_run.add(norm)
 
-                if bootstrap and len(new_articles) >= bootstrap_limit:
-                    print(f"\n[INCREMENTAL] Bootstrap limit ({bootstrap_limit}) reached.")
+                if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+                    label = "Bootstrap" if bootstrap else "Run safety"
+                    print(f"\n[INCREMENTAL] {label} limit ({max_articles}) reached.")
                     break
 
                 time.sleep(0.5)
 
-            if bootstrap and len(new_articles) >= bootstrap_limit:
+            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
                 break
     finally:
         driver.quit()

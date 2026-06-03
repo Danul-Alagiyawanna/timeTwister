@@ -16,6 +16,8 @@ from datetime import datetime
 from typing import Any, Callable
 
 from incremental import (
+    INCREMENTAL_BOOTSTRAP_LIMIT,
+    INCREMENTAL_RUN_LIMIT,
     get_last_scraped_checkpoint,
     is_last_scraped_article,
     load_known_links,
@@ -150,7 +152,8 @@ def run_incremental_scraper(
     collect_links: CollectLinksFn,
     fetch_article: FetchArticleFn,
     create_driver: CreateDriverFn | None = None,
-    bootstrap_limit: int = 40,
+    bootstrap_limit: int | None = None,
+    run_limit: int | None = None,
     sleep_between_articles: float = 0.5,
     sleep_after_list_page: float = 2.0,
     use_undetected: bool = True,
@@ -163,6 +166,14 @@ def run_incremental_scraper(
     json_path = data_json_path(data_filename)
     checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
     bootstrap = not checkpoint_link
+    if bootstrap:
+        max_articles = (
+            bootstrap_limit
+            if bootstrap_limit is not None
+            else INCREMENTAL_BOOTSTRAP_LIMIT
+        )
+    else:
+        max_articles = run_limit if run_limit is not None else INCREMENTAL_RUN_LIMIT
     # URLs already saved in the JSON file (replace-only = last run's batch)
     known_previous = load_known_links(json_path)
     if known_previous:
@@ -170,7 +181,12 @@ def run_incremental_scraper(
 
     print(f"[INCREMENTAL] {outlet_name} — stop when last scraped article is detected")
     if bootstrap:
-        print(f"[INCREMENTAL] No checkpoint; bootstrap max {bootstrap_limit} articles")
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(
+            f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
+            "(if checkpoint not found on feed)"
+        )
 
     driver_factory = create_driver or (lambda: create_standard_driver(use_undetected))
     driver = driver_factory()
@@ -225,8 +241,9 @@ def run_incremental_scraper(
                 except Exception as e:
                     print(f"[ERROR] Article failed: {e}")
 
-                if bootstrap and len(new_articles) >= bootstrap_limit:
-                    print(f"[INCREMENTAL] Bootstrap limit ({bootstrap_limit}) reached.")
+                if len(new_articles) >= max_articles:
+                    label = "Bootstrap" if bootstrap else "Run safety"
+                    print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
                     stop_all = True
                     break
 
