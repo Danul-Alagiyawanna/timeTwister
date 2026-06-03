@@ -18,6 +18,7 @@ from typing import Any, Callable
 from incremental import (
     get_last_scraped_checkpoint,
     is_last_scraped_article,
+    merge_and_save,
     normalize_link,
     save_replace_only,
 )
@@ -152,6 +153,7 @@ def run_incremental_scraper(
     sleep_between_articles: float = 0.5,
     sleep_after_list_page: float = 2.0,
     use_undetected: bool = True,
+    save_mode: str = "replace",
 ) -> int:
     """
     Scrape list pages top-to-bottom; stop at last checkpoint URL.
@@ -201,6 +203,13 @@ def run_incremental_scraper(
                 try:
                     row = fetch_article(driver, link)
                     if row:
+                        title = (row.get("title") or "").strip()
+                        summary = (
+                            (row.get("summary") or row.get("description") or "")
+                        ).strip()
+                        if not title and not summary:
+                            print(f"[SKIP] Empty row (no title/body): {link[:80]}...")
+                            continue
                         new_articles.append(row)
                         seen_this_run.add(norm)
                 except Exception as e:
@@ -219,6 +228,9 @@ def run_incremental_scraper(
         driver.quit()
 
     print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
-    save_replace_only(json_path, new_articles)
+    if save_mode == "merge":
+        merge_and_save(json_path, new_articles)
+    else:
+        save_replace_only(json_path, new_articles)
     print(f"[INCREMENTAL] {outlet_name} finished.")
     return len(new_articles)

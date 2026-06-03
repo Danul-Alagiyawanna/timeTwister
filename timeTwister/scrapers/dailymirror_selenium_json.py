@@ -31,6 +31,10 @@ from functools import wraps
 
 BASE_URL = "https://www.dailymirror.lk/latest-news/108"
 
+# List-page metadata keyed by normalized URL (used when article page extract fails on CI)
+_LIST_PAGE_HINTS: dict[str, dict] = {}
+
+
 class TimeoutError(Exception):
     """Custom timeout exception for extraction"""
     pass
@@ -783,6 +787,277 @@ def process_articles_from_list_page(driver, list_url, start_date, end_date):
     print(f"\n   Page summary: {articles_in_range} in range, {articles_outside_range} outside range")
     return articles_found, articles_in_range, articles_outside_range
 
+
+def _prepare_list_page(driver, list_url: str) -> bool:
+    """Navigate to a list page and wait for Cloudflare / article container (shared with incremental)."""
+    try:
+        driver.get(list_url)
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(5)
+    except Exception as e:
+        print(f"[ERROR] Failed to navigate to list page: {e}")
+        return False
+
+    try:
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.XPATH, "/html/body/div[7]/div/div/div/div[1]/div[2]"))
+        )
+        return True
+    except Exception:
+        page_source_lower = driver.page_source.lower()
+        if (
+            "cloudflare" in page_source_lower
+            or "challenge" in page_source_lower
+            or "checking your browser" in page_source_lower
+        ):
+            print("[WARNING] Cloudflare challenge — waiting longer...")
+            time.sleep(10)
+            try:
+                WebDriverWait(driver, 30).until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "/html/body/div[7]/div/div/div/div[1]/div[2]")
+                    )
+                )
+                return True
+            except Exception:
+                return False
+        return False
+
+
+def _normalize_article_link(url: str) -> str:
+    from incremental import normalize_link
+
+    return normalize_link(url)
+
+
+def collect_list_page_links(driver, list_url: str) -> list[str]:
+    """Ordered article URLs from one list page (same XPath as date-range main)."""
+    global _LIST_PAGE_HINTS
+    _LIST_PAGE_HINTS = {}
+    if not _prepare_list_page(driver, list_url):
+        return []
+    links: list[str] = []
+    for i in range(1, 31):
+        base_xpath = f"/html/body/div[7]/div/div/div/div[1]/div[2]/div[{i}]"
+        heading_xpath = f"{base_xpath}/div/div[1]/a[2]/h3"
+        date_xpath = f"{base_xpath}/div/div[1]/div/div[1]/h4"
+        description_xpath = f"{base_xpath}/div/div[1]/a[3]/p"
+        image_xpath = f"{base_xpath}/div/div[2]/a/img"
+        try:
+            heading = driver.find_element(By.XPATH, heading_xpath)
+            parent = heading.find_element(By.XPATH, "..")
+            href = parent.get_attribute("href")
+            if not href:
+                continue
+            title = (heading.text or "").strip()
+            try:
+                date_text = driver.find_element(By.XPATH, date_xpath).text.strip()
+            except Exception:
+                date_text = ""
+            try:
+                description = driver.find_element(By.XPATH, description_xpath).text.strip()
+            except Exception:
+                description = ""
+            try:
+                image_url = driver.find_element(By.XPATH, image_xpath).get_attribute("src") or ""
+            except Exception:
+                image_url = ""
+            links.append(href)
+            _LIST_PAGE_HINTS[_normalize_article_link(href)] = {
+                "title": title,
+                "list_description": description,
+                "list_image": image_url,
+                "date_text": date_text,
+            }
+        except Exception:
+            break
+    print(f"[INFO] collect_list_page_links: {len(links)} URLs from {list_url}")
+    return links
+
+
+def create_driver(headless=None):
+    """Same Chrome setup as main(); headless on CI (GHA has no display)."""
+    import os
+
+    if headless is None:
+        headless = os.getenv("CI", "").lower() in ("1", "true", "yes")
+
+    if USE_UNDETECTED:
+        print("[INFO] Using undetected-chromedriver to bypass Cloudflare...")
+        options = uc.ChromeOptions()
+        options.page_load_strategy = "eager"
+        if headless:
+            options.add_argument("--headless=new")
+        prefs = {"profile.default_content_setting_values": {"popups": 1}}
+        options.add_experimental_option("prefs", prefs)
+        try:
+            driver = uc.Chrome(options=options, use_subprocess=True)
+        except Exception as e:
+            error_msg = str(e)
+            match = re.search(r"Current browser version is (\d+)", error_msg)
+            if not match:
+                match = re.search(r"only supports Chrome version (\d+)", error_msg)
+            if match:
+                major_version = int(match.group(1))
+                options_retry = uc.ChromeOptions()
+                options_retry.page_load_strategy = "eager"
+                if headless:
+                    options_retry.add_argument("--headless=new")
+                options_retry.add_experimental_option(
+                    "prefs", {"profile.default_content_setting_values": {"popups": 1}}
+                )
+                driver = uc.Chrome(
+                    options=options_retry,
+                    use_subprocess=True,
+                    version_main=major_version,
+                )
+            else:
+                raise
+    else:
+        print("[WARNING] Falling back to regular Selenium (may be blocked by Cloudflare)...")
+        chrome_options = Options()
+        chrome_options.page_load_strategy = "eager"
+        if headless:
+            chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
+        chrome_options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        prefs = {"profile.default_content_setting_values": {"popups": 1}}
+        chrome_options.add_experimental_option("prefs", prefs)
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=chrome_options,
+        )
+        driver.execute_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+
+    driver.set_page_load_timeout(60)
+    return driver
+
+
+def _parse_list_date_text(date_text: str) -> datetime | None:
+    if not date_text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(date_text.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def article_row_from_extract(
+    meta: dict | None, link: str, hint: dict | None = None
+) -> dict | None:
+    """JSON row matching date-range main() output (title, link, summary, date, image_url, date_source)."""
+    hint = hint or {}
+    body = ""
+    title = ""
+    image_url = ""
+    article_date = None
+    from_article_page = False
+
+    if meta:
+        body = (meta.get("description") or "").strip()
+        title = (meta.get("title") or "").strip()
+        image_url = (meta.get("image_url") or "").strip()
+        article_date = meta.get("date_published")
+        from_article_page = bool(body)
+
+    if not title:
+        title = (hint.get("title") or "").strip()
+    if not body:
+        body = (hint.get("list_description") or "").strip()
+    if not image_url:
+        image_url = (hint.get("list_image") or "").strip()
+
+    if not title and not body:
+        print(f"[SKIP] No title or body for {link[:80]}...")
+        return None
+
+    if not article_date:
+        article_date = _parse_list_date_text(hint.get("date_text") or "")
+
+    standardized_date = (
+        article_date.strftime("%Y-%m-%d %H:%M:%S")
+        if article_date
+        else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    if from_article_page:
+        date_source = "Article page"
+    elif body or title:
+        date_source = "List page fallback"
+    else:
+        date_source = "Incremental scrape"
+
+    return {
+        "title": title,
+        "link": (meta or {}).get("link") or link,
+        "summary": body,
+        "date": standardized_date,
+        "image_url": image_url,
+        "date_source": date_source,
+    }
+
+
+def fetch_article_incremental(driver, link: str) -> dict | None:
+    import os
+
+    hint = _LIST_PAGE_HINTS.get(_normalize_article_link(link), {})
+    for attempt in range(2):
+        try:
+            driver.get(link)
+            time.sleep(5 if os.getenv("CI") else 2)
+            meta = extract_with_timeout(driver, timeout_seconds=60)
+            row = article_row_from_extract(meta, link, hint)
+            if row and (row.get("summary") or "").strip():
+                return row
+            if row and attempt == 1:
+                return row
+        except Exception as e:
+            print(f"[ERROR] fetch attempt {attempt + 1}: {e}")
+        time.sleep(2)
+    return article_row_from_extract(None, link, hint)
+
+
+def main_incremental():
+    """Incremental on GHA: same driver + extract_article_content + archive merge as local main()."""
+    import os
+
+    scraper_dir = os.path.dirname(os.path.abspath(__file__))
+    if scraper_dir not in sys.path:
+        sys.path.insert(0, scraper_dir)
+    from incremental_runner import run_incremental_scraper
+
+    pages = [
+        ("latest", BASE_URL),
+        ("latest-p30", f"{BASE_URL}/30"),
+    ]
+
+    run_incremental_scraper(
+        outlet_name="Daily Mirror",
+        data_filename="dailymirror_latest_news.json",
+        pages=pages,
+        collect_links=collect_list_page_links,
+        fetch_article=fetch_article_incremental,
+        create_driver=create_driver,
+        use_undetected=False,
+        save_mode="merge",
+        sleep_between_articles=1.0,
+        sleep_after_list_page=2.0,
+    )
+
+
 def main(start_date=None, end_date=None):
     """Main function with click-and-back navigation approach."""
     
@@ -795,99 +1070,9 @@ def main(start_date=None, end_date=None):
         print(f"[DATE] Scraping articles from {start_date} to {end_date}")
     
     print("[INFO] Starting Enhanced Daily Mirror scraper with click-and-back navigation...")
-    
-    import os
-    
-    if USE_UNDETECTED:
-        print("[INFO] Using undetected-chromedriver to bypass Cloudflare...")
-        
-        options = uc.ChromeOptions()
-        options.page_load_strategy = 'eager'
-        # options.add_argument('--headless')  # Disabled for debugging
-        
-        # Disable popup blocking to allow new tabs
-        prefs = {
-            "profile.default_content_setting_values": {
-                "popups": 1  # Allow popups
-            }
-        }
-        options.add_experimental_option("prefs", prefs)
-        
-        # undetected-chromedriver is designed to bypass Cloudflare automatically
-        # No need for Chrome profile - it handles anti-bot detection on its own
-        print(f"[INFO] Starting undetected Chrome (bypasses Cloudflare automatically)...")
-        
-        try:
-            # Let undetected-chromedriver auto-detect Chrome version
-            driver = uc.Chrome(options=options, use_subprocess=True)
-            print("[INFO] Undetected Chrome browser started successfully")
-        except Exception as e:
-            error_msg = str(e)
-            print(f"[WARNING] Initial attempt failed: {error_msg}")
 
-            # Try to extract the installed Chrome major version from the error message
-            match = re.search(r"Current browser version is (\d+)", error_msg)
-            if not match:
-                match = re.search(r"only supports Chrome version (\d+)", error_msg)
-
-            if match:
-                major_version = int(match.group(1))
-                print(f"[INFO] Mismatched chromedriver. Retrying with version_main={major_version}...")
-                try:
-                    options_retry = uc.ChromeOptions()
-                    options_retry.page_load_strategy = 'eager'
-                    options_retry.add_experimental_option("prefs", {"profile.default_content_setting_values": {"popups": 1}})
-                    driver = uc.Chrome(options=options_retry, use_subprocess=True, version_main=major_version)
-                    print(f"[INFO] Undetected Chrome browser (forced version {major_version}) started successfully")
-                except Exception as retry_err:
-                    print(f"[WARNING] Retry with version_main={major_version} failed: {retry_err}")
-                    print(f"[INFO] Trying with fresh ChromeOptions and version_main={major_version}...")
-                    options_retry2 = uc.ChromeOptions()
-                    options_retry2.page_load_strategy = 'eager'
-                    options_retry2.add_experimental_option("prefs", {"profile.default_content_setting_values": {"popups": 1}})
-                    driver = uc.Chrome(options=options_retry2, use_subprocess=True, version_main=major_version)
-                    print(f"[INFO] Undetected Chrome browser (forced version {major_version}) started successfully")
-            else:
-                print(f"[INFO] Trying with fresh ChromeOptions...")
-                options_retry2 = uc.ChromeOptions()
-                options_retry2.page_load_strategy = 'eager'
-                options_retry2.add_experimental_option("prefs", {"profile.default_content_setting_values": {"popups": 1}})
-                driver = uc.Chrome(options=options_retry2, use_subprocess=True)
-                print(f"[INFO] Undetected Chrome browser started successfully")
-    else:
-        print("[WARNING] undetected-chromedriver not installed. Install with: pip install undetected-chromedriver")
-        print("[INFO] Falling back to regular Selenium (may be blocked by Cloudflare)...")
-        
-        chrome_options = Options()
-        chrome_options.page_load_strategy = 'eager'
-        # chrome_options.add_argument('--headless')  # Disabled for debugging
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        
-        # Disable popup blocking to allow new tabs
-        prefs = {
-            "profile.default_content_setting_values": {
-                "popups": 1  # Allow popups
-            }
-        }
-        chrome_options.add_experimental_option("prefs", prefs)
-
-        service = Service(ChromeDriverManager().install())
-        print(f"[INFO] Starting Chrome browser...")
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        print(f"[INFO] Chrome browser started successfully")
-        
-        # Add stealth settings
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        print(f"[INFO] Stealth settings applied")
-    
-    # Set page load timeout to prevent hanging
-    driver.set_page_load_timeout(60)  # 60 seconds timeout
-    print(f"[INFO] Page load timeout set to 60 seconds")
+    driver = create_driver(headless=False)
+    print("[INFO] Page load timeout set to 60 seconds")
 
     all_articles = []
     total_articles_in_range = 0
@@ -992,9 +1177,7 @@ if __name__ == "__main__":
     from incremental import is_incremental_mode
 
     if is_incremental_mode():
-        from incremental_outlets import run_incremental_for_module
-
-        run_incremental_for_module("dailymirror_selenium_json")
+        main_incremental()
         sys.exit(0)
 
     # Check if date range is provided as command line arguments
