@@ -74,15 +74,82 @@ def _load_articles_list(json_path: str) -> list[dict[str, Any]]:
         return []
 
 
+def load_checkpoint_state(articles_json_path: str) -> dict[str, Any]:
+    cp_path = _checkpoint_path(articles_json_path)
+    if not os.path.isfile(cp_path):
+        return {}
+    try:
+        with open(cp_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def get_section_checkpoint(
+    articles_json_path: str,
+    section_key: str,
+) -> tuple[str | None, str | None]:
+    """Per-feed checkpoint (e.g. ftlk top-story/26). Returns normalized (link, title)."""
+    sections = load_checkpoint_state(articles_json_path).get("sections") or {}
+    entry = sections.get(section_key)
+    if isinstance(entry, dict) and entry.get("last_scraped_link"):
+        link = normalize_link(entry["last_scraped_link"])
+        title = entry.get("last_scraped_title") or ""
+        return link, title
+    return None, None
+
+
+def update_section_checkpoints(
+    articles_json_path: str,
+    section_updates: dict[str, tuple[str, str]],
+    *,
+    global_newest: tuple[str, str] | None = None,
+) -> None:
+    """Merge per-section boundaries into the checkpoint file."""
+    if not section_updates and not global_newest:
+        return
+
+    cp_path = _checkpoint_path(articles_json_path)
+    state = load_checkpoint_state(articles_json_path)
+    sections: dict[str, Any] = dict(state.get("sections") or {})
+
+    for key, (link, title) in section_updates.items():
+        if link:
+            sections[key] = {
+                "last_scraped_link": link,
+                "last_scraped_title": title,
+            }
+
+    state["sections"] = sections
+    if global_newest and global_newest[0]:
+        state["last_scraped_link"] = global_newest[0]
+        state["last_scraped_title"] = global_newest[1]
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    os.makedirs(os.path.dirname(cp_path) or ".", exist_ok=True)
+    with open(cp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
 def get_last_scraped_checkpoint(articles_json_path: str) -> tuple[str | None, str | None]:
     """
     Return (normalized_url, title) of the newest article from the previous run.
     That article is the stop boundary for the next incremental scrape.
     Returns (None, None) on first / bootstrap run.
     """
-    # Try dedicated checkpoint file first (written by merge_and_save)
     cp_path = _checkpoint_path(articles_json_path)
-    if os.path.isfile(cp_path):
+    state = load_checkpoint_state(articles_json_path)
+    if state.get("last_scraped_link"):
+        try:
+            link = state["last_scraped_link"]
+            norm = normalize_link(link)
+            title = state.get("last_scraped_title") or ""
+            print(f"[INCREMENTAL] Checkpoint: {title[:70] or norm}")
+            return norm, title
+        except (KeyError, TypeError):
+            pass
+    if os.path.isfile(cp_path) and not state:
         try:
             with open(cp_path, encoding="utf-8") as f:
                 state = json.load(f)
@@ -117,11 +184,10 @@ def is_last_scraped_article(link: str, checkpoint_link: str | None) -> bool:
 def _save_checkpoint(articles_json_path: str, link: str, title: str = "") -> None:
     cp_path = _checkpoint_path(articles_json_path)
     os.makedirs(os.path.dirname(cp_path) or ".", exist_ok=True)
-    state = {
-        "last_scraped_link": link,
-        "last_scraped_title": title,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    state = load_checkpoint_state(articles_json_path)
+    state["last_scraped_link"] = link
+    state["last_scraped_title"] = title
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
     with open(cp_path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 

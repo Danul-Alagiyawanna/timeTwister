@@ -15,12 +15,15 @@ from datetime import datetime, timedelta
 
 from incremental import (
     incremental_fetch_limit,
+    get_section_checkpoint,
     is_incremental_mode,
     get_last_scraped_checkpoint,
     is_last_scraped_article,
+    load_checkpoint_state,
     load_known_links,
     reached_incremental_limit,
     save_replace_only,
+    update_section_checkpoints,
     normalize_link,
 )
 
@@ -35,6 +38,51 @@ FTLK_LIST_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("sports", "23"),
     ("travel-tourism", "27"),
 )
+
+# Map article URL path segment -> list-page section key (for checkpoint migration)
+_FTLK_URL_SECTION_HINTS: tuple[tuple[str, str], ...] = (
+    ("/top-story/", "top-story/26"),
+    ("/front-page/", "news/44"),
+    ("/business/", "business-news/34"),
+    ("/opinion/", "opinion/14"),
+    ("/columns/", "columns/18"),
+    ("/sports/", "sports/23"),
+    ("/travel-tourism/", "travel-tourism/27"),
+)
+
+
+def _ftlk_section_key(cat_name: str, cat_id: str) -> str:
+    return f"{cat_name}/{cat_id}"
+
+
+def _infer_ftlk_section_from_url(link: str) -> str | None:
+    for needle, section_key in _FTLK_URL_SECTION_HINTS:
+        if needle in link:
+            return section_key
+    return None
+
+
+def _migrate_ftlk_section_checkpoints(json_filename: str) -> None:
+    """Seed sections{} from legacy single global checkpoint."""
+    state = load_checkpoint_state(json_filename)
+    if state.get("sections"):
+        return
+    global_link = state.get("last_scraped_link") or ""
+    if not global_link:
+        return
+    section_key = _infer_ftlk_section_from_url(global_link)
+    if not section_key:
+        return
+    update_section_checkpoints(
+        json_filename,
+        {
+            section_key: (
+                global_link,
+                state.get("last_scraped_title") or "",
+            )
+        },
+    )
+    print(f"[INCREMENTAL] Migrated global checkpoint → section {section_key}")
 
 
 def _data_json_path():
@@ -670,19 +718,25 @@ def get_articles_from_page(driver, url, start_date, end_date):
     return articles_found, articles_in_range, articles_outside_range
 
 def main_incremental():
-    """Scrape first page of each category, stop when the last-scraped article URL is detected."""
+    """Scrape page 1 of each FT.lk section; stop each section at its own checkpoint."""
     json_filename = _data_json_path()
-    checkpoint_link, checkpoint_title = get_last_scraped_checkpoint(json_filename)
-    bootstrap = not checkpoint_link
+    _migrate_ftlk_section_checkpoints(json_filename)
+
+    has_any_section_cp = any(
+        get_section_checkpoint(json_filename, _ftlk_section_key(c, i))[0]
+        for c, i in FTLK_LIST_CATEGORIES
+    )
+    global_checkpoint_link, _ = get_last_scraped_checkpoint(json_filename)
+    bootstrap = not has_any_section_cp and not global_checkpoint_link
     max_articles = incremental_fetch_limit(bootstrap=bootstrap)
 
-    print("[INCREMENTAL] FT.lk — stop when last scraped article is detected")
+    print("[INCREMENTAL] FT.lk — per-section checkpoints (stop each feed independently)")
     if bootstrap:
         print(f"[INCREMENTAL] No prior data; bootstrap (max {max_articles} articles)")
     else:
         print(
             f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
-            "(if checkpoint not found on feed)"
+            "(if a section checkpoint is missing from its feed)"
         )
 
     driver = _create_driver(headless=True)
@@ -693,24 +747,37 @@ def main_incremental():
 
     new_articles = []
     seen_this_run = set()
+    section_updates: dict[str, tuple[str, str]] = {}
 
     try:
         for cat_name, cat_id in FTLK_LIST_CATEGORIES:
+            section_key = _ftlk_section_key(cat_name, cat_id)
+            section_checkpoint_link, section_checkpoint_title = get_section_checkpoint(
+                json_filename, section_key
+            )
+            if section_checkpoint_link:
+                print(f"[INCREMENTAL] Section checkpoint {section_key}: "
+                      f"{section_checkpoint_title[:50] or section_checkpoint_link[:60]}")
+
             page_url = f"https://www.ft.lk/{cat_name}/{cat_id}"
             print(f"\n{'=' * 60}")
-            print(f"[INCREMENTAL] Category: {cat_name}/{cat_id}")
+            print(f"[INCREMENTAL] Category: {section_key}")
             print(f"{'=' * 60}")
 
             entries = get_list_entries_from_page(driver, page_url)
             if not entries:
                 continue
 
+            section_newest: tuple[str, str] | None = None
+
             for i, entry in enumerate(entries, 1):
                 link = entry['link']
                 norm = normalize_link(link)
 
-                if is_last_scraped_article(link, checkpoint_link):
-                    print(f"\n[INCREMENTAL] Reached checkpoint on {cat_name}/{cat_id} — next section.")
+                if section_checkpoint_link and is_last_scraped_article(
+                    link, section_checkpoint_link
+                ):
+                    print(f"\n[INCREMENTAL] Section {section_key} caught up at checkpoint.")
                     print(f"             {link}")
                     break
 
@@ -736,9 +803,10 @@ def main_incremental():
                     else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
                 final_description = metadata.get('full_content') or metadata['description']
+                title = metadata['title'] or entry['title']
 
                 new_articles.append({
-                    'title': metadata['title'] or entry['title'],
+                    'title': title,
                     'link': link,
                     'summary': final_description,
                     'date': standardized_date,
@@ -747,12 +815,25 @@ def main_incremental():
                 })
                 seen_this_run.add(norm)
 
+                if section_newest is None:
+                    section_newest = (link, title)
+
                 if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
                     label = "Bootstrap" if bootstrap else "Run safety"
                     print(f"\n[INCREMENTAL] {label} limit ({max_articles}) reached.")
                     break
 
                 time.sleep(0.5)
+
+            if section_newest:
+                section_updates[section_key] = section_newest
+            elif not section_checkpoint_link and entries:
+                # Seed this section's boundary from list head (no new fetches needed)
+                head = entries[0]
+                section_updates[section_key] = (
+                    head["link"],
+                    head.get("title") or "",
+                )
 
             if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
                 break
@@ -761,6 +842,19 @@ def main_incremental():
 
     print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
     save_replace_only(json_filename, new_articles)
+
+    global_newest = None
+    if new_articles:
+        top = new_articles[0]
+        global_newest = (top.get("link", ""), top.get("title", ""))
+    if section_updates:
+        update_section_checkpoints(
+            json_filename,
+            section_updates,
+            global_newest=global_newest,
+        )
+        print(f"[INCREMENTAL] Updated {len(section_updates)} section checkpoint(s)")
+
     print("\n[INFO] FT.lk incremental scraper finished.")
 
 
