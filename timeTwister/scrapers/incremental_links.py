@@ -79,7 +79,7 @@ def _economynext_fetch_with_cffi(url: str) -> "BeautifulSoup | None":
             timeout=30,
             headers={"Accept-Language": "en-US,en;q=0.9"},
         )
-        if resp.status_code == 200:
+        if resp.status_code in (200, 202):
             title_match = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.IGNORECASE | re.DOTALL)
             title = (title_match.group(1) if title_match else "").strip()
             if "just a moment" in title.lower():

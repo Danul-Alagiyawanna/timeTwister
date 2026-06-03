@@ -146,6 +146,107 @@ def run_dailymirror_incremental() -> int:
     )
 
 
+def _economynext_extract_from_soup(soup, link: str) -> dict | None:
+    """Extract EconomyNext article fields from a BeautifulSoup object (static HTML)."""
+    from datetime import datetime
+    import json as _json
+
+    # Title
+    title = ""
+    h1 = soup.find("h1")
+    if h1:
+        title = h1.get_text(strip=True)
+    if not title:
+        og = soup.find("meta", attrs={"property": "og:title"})
+        if og:
+            title = og.get("content", "").strip()
+
+    # Date
+    date_published = None
+    date_meta = soup.find("meta", attrs={"property": "article:published_time"})
+    if date_meta and date_meta.get("content"):
+        date_str = date_meta["content"]
+        if "," in date_str:
+            date_part = date_str.split(",", 1)[1].strip()
+            for fmt in ["%A %B %d, %Y", "%A %b %d, %Y"]:
+                try:
+                    date_published = datetime.strptime(date_part, fmt)
+                    break
+                except ValueError:
+                    continue
+    if not date_published:
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = _json.loads(script.string or "")
+                if isinstance(data, dict) and "datePublished" in data:
+                    date_published = datetime.fromisoformat(
+                        data["datePublished"].replace("Z", "").split("+")[0]
+                    )
+                    break
+            except Exception:
+                continue
+
+    # Image
+    image_url = ""
+    og_img = soup.find("meta", attrs={"property": "og:image"})
+    if og_img:
+        image_url = og_img.get("content", "")
+
+    # Description
+    description = ""
+    main_divs = [
+        d for d in soup.find_all("div", class_="story-page-text-content")
+        if "most-recent-article-text" not in " ".join(d.get("class", []))
+    ] or soup.find_all("div", class_="story-page-text-content")
+    if main_divs:
+        paras = [p.get_text(strip=True) for p in main_divs[0].find_all("p") if p.get_text(strip=True)]
+        description = "\n\n".join(paras) if paras else main_divs[0].get_text(strip=True)
+
+    if not title and not description:
+        return None
+
+    standardized_date = (
+        date_published.strftime("%Y-%m-%d %H:%M:%S")
+        if date_published
+        else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+    return {
+        "title": title,
+        "link": link,
+        "summary": description,
+        "description": description,
+        "date": standardized_date,
+        "image_url": image_url,
+        "date_source": f"Article page: {standardized_date}" if date_published else "Incremental scrape",
+    }
+
+
+def _economynext_fetch_article(driver, link: str, mod) -> dict | None:
+    """Fetch EconomyNext article: try curl_cffi first (bypasses Cloudflare), fall back to Selenium."""
+    # Try curl_cffi first — works from GHA datacenter IPs
+    try:
+        from curl_cffi import requests as cf_requests  # type: ignore
+        from bs4 import BeautifulSoup as _BS
+
+        resp = cf_requests.get(link, impersonate="chrome", timeout=30)
+        if resp.status_code in (200, 202, 301, 302):
+            soup = _BS(resp.text, "html.parser")
+            title_tag = soup.find("title") or soup.find("h1")
+            title_text = (title_tag.get_text(strip=True) if title_tag else "").lower()
+            if "just a moment" not in title_text:
+                result = _economynext_extract_from_soup(soup, link)
+                if result and (result.get("title") or result.get("summary")):
+                    print(f"     [curl_cffi] Extracted: {result.get('title', '')[:60]}")
+                    return result
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"     [curl_cffi] Failed: {e}")
+
+    # Fall back to Selenium
+    return _fetch_metadata(driver, link, mod)
+
+
 def run_economynext_incremental() -> int:
     mod = _import_scraper("economynext_selenium_json")
     pages = [
@@ -159,7 +260,7 @@ def run_economynext_incremental() -> int:
         return collect_economynext_homepage_links(d, url)
 
     def fetch(d, link):
-        return _fetch_metadata(d, link, mod)
+        return _economynext_fetch_article(d, link, mod)
 
     return run_incremental_scraper(
         outlet_name="EconomyNext",
