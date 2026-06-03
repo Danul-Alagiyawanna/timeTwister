@@ -165,6 +165,7 @@ def run_economynext_incremental() -> int:
 
     RSS_FEED = "https://economynext.com/feed/"
     WP_API = "https://economynext.com/wp-json/wp/v2/posts"
+    GNEWS_RSS = "https://news.google.com/rss/search?q=site:economynext.com&hl=en-US&gl=US&ceid=US:en"
     json_path = data_json_path("economynext_latest_news.json")
 
     checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
@@ -293,6 +294,56 @@ def run_economynext_incremental() -> int:
                 print(f"[INFO] WP-API returned {len(articles_raw)} posts")
             except Exception as e:
                 print(f"[WARN] WP-API parse error: {e}")
+
+    # --- source 3: Google News RSS (served from Google CDN, never CF-blocked) ---
+    if not articles_raw:
+        import base64 as _b64
+        print("[INFO] WP-API unavailable — trying Google News RSS...")
+
+        def _decode_gnews_url(gnews_url: str) -> str:
+            """Extract original article URL from a Google News redirect link."""
+            m = _re.search(r"/articles/([^?&#]+)", gnews_url)
+            if not m:
+                return gnews_url
+            try:
+                padded = m.group(1) + "=" * (-len(m.group(1)) % 4)
+                raw = _b64.urlsafe_b64decode(padded)
+                urls = _re.findall(rb"https?://[^\x00-\x1f\x7f-\xff ]+", raw)
+                if urls:
+                    return urls[0].decode("utf-8").rstrip(".")
+            except Exception:
+                pass
+            return gnews_url
+
+        resp = _get(GNEWS_RSS)
+        if resp and len(resp.text) > 200:
+            try:
+                root = ET.fromstring(resp.text)
+                for item in root.findall(".//item"):
+                    gnews_link = (item.findtext("link") or "").strip()
+                    if not gnews_link:
+                        continue
+                    link = _decode_gnews_url(gnews_link)
+                    # keep only economynext.com links
+                    if "economynext.com" not in link:
+                        link = gnews_link
+                    title = (item.findtext("title") or "").strip()
+                    pub_date = (item.findtext("pubDate") or "").strip()
+                    desc_html = (item.findtext("description") or "").strip()
+                    date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if pub_date:
+                        try:
+                            from email.utils import parsedate_to_datetime as _p2d
+                            date_str = _p2d(pub_date).strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            pass
+                    desc_text = BS(desc_html, "html.parser").get_text(separator="\n", strip=True) if desc_html else ""
+                    articles_raw.append({"title": title, "link": link, "summary": desc_text,
+                                         "description": desc_text, "date": date_str,
+                                         "image_url": "", "date_source": f"GNews: {date_str}"})
+                print(f"[INFO] Google News RSS returned {len(articles_raw)} items")
+            except ET.ParseError as e:
+                print(f"[WARN] Google News RSS parse error: {e}")
 
     if not articles_raw:
         print("[ERROR] All sources failed — saving empty list")
