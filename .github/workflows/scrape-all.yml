@@ -42,6 +42,9 @@ on:
 env:
   PYTHON_VERSION: "3.11"
 
+permissions:
+  contents: write
+
 jobs:
   # matrix.* is not allowed on job-level if: — filter outlets here instead
   prepare-matrix:
@@ -86,6 +89,8 @@ jobs:
     needs: prepare-matrix
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       max-parallel: 17
@@ -144,21 +149,39 @@ jobs:
               print('${{ matrix.id }}: missing', p)
           "
 
+      - name: Stage outlet files for artifact
+        if: always()
+        run: |
+          mkdir -p timeTwister/data artifact-upload/timeTwister/data
+          DATA="timeTwister/data/${{ matrix.data_file }}"
+          STEM="${{ matrix.data_file }}"
+          STEM="${STEM%.json}"
+          CP="timeTwister/data/${STEM}_checkpoint.json"
+          if [ -f "$DATA" ]; then
+            cp "$DATA" artifact-upload/timeTwister/data/
+            echo "Packed $DATA ($(wc -c < "$DATA") bytes)"
+          else
+            echo "No data file at $DATA"
+          fi
+          if [ -f "$CP" ]; then
+            cp "$CP" artifact-upload/timeTwister/data/
+          fi
+          ls -la artifact-upload/timeTwister/data/ || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: data-${{ matrix.id }}
-          path: |
-            timeTwister/data/${{ matrix.data_file }}
-            timeTwister/data/*checkpoint*.json
+          path: artifact-upload/timeTwister/data/
           retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
   commit-data:
     name: Commit merged data
     needs: [prepare-matrix, scrape]
     runs-on: ubuntu-latest
-    if: always() && (needs.scrape.result == 'success' || needs.scrape.result == 'failure')
+    # Run even when matrix jobs were cancelled (partial artifacts) or failed
+    if: always() && needs.prepare-matrix.result == 'success'
     permissions:
       contents: write
     steps:
@@ -167,19 +190,37 @@ jobs:
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          path: .
+          path: artifacts
           pattern: data-*
           merge-multiple: true
+
+      - name: Merge artifacts into timeTwister/data
+        run: |
+          mkdir -p timeTwister/data
+          echo "=== Artifact tree ==="
+          find artifacts -type f 2>/dev/null | head -80 || echo "(no artifacts dir)"
+          # v4 merge-multiple: files may be at artifacts/*.json or nested paths
+          find artifacts -type f -name '*.json' 2>/dev/null | while read -r f; do
+            base=$(basename "$f")
+            cp -f "$f" "timeTwister/data/$base"
+            echo "Copied $f -> timeTwister/data/$base"
+          done
+          echo "=== timeTwister/data after merge ==="
+          ls -la timeTwister/data/ || true
+          count=$(find timeTwister/data -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+          echo "JSON files: $count"
 
       - name: Commit and push data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f timeTwister/data/*.json || true
+          git add -f timeTwister/data/*.json
           git status
           if git diff --cached --quiet; then
-            echo "No data changes."
+            echo "::warning::No data changes to commit. Check matrix logs and artifact merge step."
+            exit 0
           else
             git commit -m "chore: scrape all outlets $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
