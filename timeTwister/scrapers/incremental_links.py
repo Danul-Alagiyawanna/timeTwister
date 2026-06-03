@@ -68,8 +68,30 @@ def collect_dailymirror_links(driver: Any, url: str) -> list[str]:
     return links
 
 
+def _economynext_is_blocked(driver: Any) -> bool:
+    """Return True when Cloudflare is serving a challenge instead of real content."""
+    try:
+        title = driver.title or ""
+        if "just a moment" in title.lower() or "checking your browser" in title.lower():
+            print(f"[WARN] EconomyNext Cloudflare block detected (title: {title!r})")
+            return True
+        # Also check if there are basically no economynext.com article links at all
+        source_snippet = (driver.page_source or "")[:500]
+        if "challenge" in source_snippet.lower() and "economynext" not in source_snippet.lower():
+            print("[WARN] EconomyNext: Cloudflare challenge page detected in source")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def collect_economynext_homepage_links(driver: Any, _url: str) -> list[str]:
     _navigate(driver, "https://economynext.com/", 5)
+
+    if _economynext_is_blocked(driver):
+        print("[WARN] EconomyNext homepage blocked by Cloudflare on this IP — returning []")
+        return []
+
     soup = BeautifulSoup(driver.page_source, "html.parser")
     links_with_ids: list[tuple[str, int]] = []
     for a in soup.find_all("a", href=True):
@@ -84,6 +106,7 @@ def collect_economynext_homepage_links(driver: Any, _url: str) -> list[str]:
             if (href, pid) not in links_with_ids:
                 links_with_ids.append((href, pid))
     if not links_with_ids:
+        print(f"[WARN] EconomyNext: 0 article links found (page title: {driver.title!r})")
         return []
     threshold = max(pid for _, pid in links_with_ids) - 800
     return [u for u, pid in links_with_ids if pid >= threshold]
@@ -91,11 +114,17 @@ def collect_economynext_homepage_links(driver: Any, _url: str) -> list[str]:
 
 def collect_economynext_list_links(driver: Any, url: str) -> list[str]:
     _navigate(driver, url, 3)
+
+    if _economynext_is_blocked(driver):
+        print("[WARN] EconomyNext more-news blocked by Cloudflare on this IP — returning []")
+        return []
+
     try:
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CLASS_NAME, "story-grid-single-story"))
         )
     except Exception:
+        print(f"[WARN] EconomyNext more-news: story-grid-single-story not found (title: {driver.title!r})")
         return []
     links: list[str] = []
     for card in driver.find_elements(By.CLASS_NAME, "story-grid-single-story"):
