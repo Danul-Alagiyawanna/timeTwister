@@ -157,6 +157,35 @@ def merge_and_save(
     return added
 
 
+def save_replace_only(
+    json_path: str,
+    articles: list[dict[str, Any]],
+) -> int:
+    """
+    Overwrite the JSON with exactly these articles (use [] when none).
+    Does not merge with previous file contents.
+    Updates checkpoint to articles[0] when non-empty; leaves checkpoint unchanged when empty.
+    """
+    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+
+    if articles:
+        newest = articles[0]
+        _save_checkpoint(
+            json_path,
+            newest.get("link", ""),
+            newest.get("title", ""),
+        )
+        print(
+            f"[INCREMENTAL] Replaced file with {len(articles)} article(s) → {json_path}"
+        )
+    else:
+        print(f"[INCREMENTAL] No new articles — saved empty list → {json_path}")
+
+    return len(articles)
+
+
 def load_known_links(json_path: str) -> set[str]:
     """All URLs in the archive. Used for within-run dedup."""
     known: set[str] = set()

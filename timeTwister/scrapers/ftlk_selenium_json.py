@@ -17,7 +17,7 @@ from incremental import (
     is_incremental_mode,
     get_last_scraped_checkpoint,
     is_last_scraped_article,
-    merge_and_save,
+    save_replace_only,
     normalize_link,
 )
 
@@ -734,10 +734,7 @@ def main_incremental():
         driver.quit()
 
     print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
-    if new_articles:
-        merge_and_save(json_filename, new_articles)
-    else:
-        print(f"[INCREMENTAL] Nothing new; leaving {json_filename} unchanged.")
+    save_replace_only(json_filename, new_articles)
     print("\n[INFO] FT.lk incremental scraper finished.")
 
 
