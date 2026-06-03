@@ -18,6 +18,7 @@ from typing import Any, Callable
 from incremental import (
     get_last_scraped_checkpoint,
     is_last_scraped_article,
+    load_known_links,
     merge_and_save,
     normalize_link,
     save_replace_only,
@@ -162,6 +163,10 @@ def run_incremental_scraper(
     json_path = data_json_path(data_filename)
     checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
     bootstrap = not checkpoint_link
+    # URLs already saved in the JSON file (replace-only = last run's batch)
+    known_previous = load_known_links(json_path)
+    if known_previous:
+        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
 
     print(f"[INCREMENTAL] {outlet_name} — stop when last scraped article is detected")
     if bootstrap:
@@ -189,13 +194,18 @@ def run_incremental_scraper(
             print(f"[INFO] {len(links)} links on list page")
 
             for i, link in enumerate(links, 1):
+                norm = normalize_link(link)
+
                 if is_last_scraped_article(link, checkpoint_link):
                     print(f"\n[INCREMENTAL] Reached last scraped article — stopping.")
                     print(f"             {link}")
                     stop_all = True
                     break
 
-                norm = normalize_link(link)
+                if norm in known_previous:
+                    print(f"[SKIP] Already in previous run: {link[:80]}...")
+                    continue
+
                 if norm in seen_this_run:
                     continue
 

@@ -873,7 +873,9 @@ def collect_list_page_links(driver, list_url: str) -> list[str]:
             }
         except Exception:
             break
-    print(f"[INFO] collect_list_page_links: {len(links)} URLs from {list_url}")
+    # DOM order is oldest-first; incremental expects newest-first (stop at checkpoint early)
+    links.reverse()
+    print(f"[INFO] collect_list_page_links: {len(links)} URLs (newest-first) from {list_url}")
     return links
 
 
@@ -1039,10 +1041,8 @@ def main_incremental():
         sys.path.insert(0, scraper_dir)
     from incremental_runner import run_incremental_scraper
 
-    pages = [
-        ("latest", BASE_URL),
-        ("latest-p30", f"{BASE_URL}/30"),
-    ]
+    # One list page only — stop at checkpoint; page 2 caused re-scraping past the boundary
+    pages = [("latest", BASE_URL)]
 
     run_incremental_scraper(
         outlet_name="Daily Mirror",
