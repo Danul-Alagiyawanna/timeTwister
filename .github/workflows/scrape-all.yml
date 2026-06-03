@@ -1,0 +1,160 @@
+# Run all TimeTwister scrapers (matrix).
+# incremental=true → FT.lk-style (--incremental, checkpoint, replace JSON only)
+# incremental=false → date-range (yesterday–today) + xvfb on CI
+
+name: Scrape all news outlets
+
+on:
+  workflow_dispatch:
+    inputs:
+      scraper:
+        description: "Which scraper to run (all = full matrix)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - sundaytimes
+          - dailynews
+          - ceylontoday
+          - dailymirror
+          - ftlk
+          - economynext
+          - morning
+          - island
+          - sundayobserver
+          - dinamina
+          - divaina
+          - lankadeepa
+          - aruna
+          - mawbima
+          - virakesari
+          - thinakaran
+          - thamilan
+  schedule:
+    - cron: "0 6,18 * * *"
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  scrape:
+    name: ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'schedule' || github.event.inputs.scraper == 'all' || github.event.inputs.scraper == matrix.id
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - { id: sundaytimes, module: sundaytimes_selenium_json, data_file: sundaytimes_latest_news.json, incremental: true }
+          - { id: dailynews, module: dailynews_selenium_json, data_file: dailynews_latest_news.json, incremental: true }
+          - { id: ceylontoday, module: ceylontoday_selenium_json, data_file: ceylontoday_finance.json, incremental: true }
+          - { id: dailymirror, module: dailymirror_selenium_json, data_file: dailymirror_latest_news.json, incremental: true }
+          - { id: ftlk, module: ftlk_selenium_json, data_file: ftlk_latest_news.json, incremental: true }
+          - { id: economynext, module: economynext_selenium_json, data_file: economynext_latest_news.json, incremental: true }
+          - { id: morning, module: themorning_selenium_json, data_file: themorning_latest_news.json, incremental: true }
+          - { id: island, module: island_selenium_json, data_file: island_latest_news.json, incremental: true }
+          - { id: sundayobserver, module: sundayobserver_selenium_json, data_file: sundayobserver_latest_news.json, incremental: true }
+          - { id: dinamina, module: dinamina_selenium_json, data_file: dinamina_latest_news.json, incremental: true }
+          - { id: divaina, module: divaina_selenium_json, data_file: divaina_latest_news.json, incremental: true }
+          - { id: lankadeepa, module: lankadeepa_selenium_json, data_file: lankadeepa_latest_news.json, incremental: true }
+          - { id: aruna, module: aruna_selenium_json, data_file: aruna_latest_news.json, incremental: true }
+          - { id: mawbima, module: mawbima_selenium_json, data_file: mawbima_latest_news.json, incremental: true }
+          - { id: virakesari, module: virakesari_selenium_json, data_file: virakesari_latest_news.json, incremental: true }
+          - { id: thinakaran, module: thinakaran_selenium_json, data_file: thinakaran_latest_news.json, incremental: true }
+          - { id: thamilan, module: thamilan_selenium_json, data_file: thamilan_latest_news.json, incremental: true }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            timeTwister/data/${{ matrix.data_file }}
+            timeTwister/data/*_checkpoint.json
+          key: scrape-${{ matrix.id }}-${{ runner.os }}
+          restore-keys: |
+            scrape-${{ matrix.id }}-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: timeTwister/requirements.txt
+
+      - run: pip install -r timeTwister/requirements.txt
+
+      - uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Run incremental scraper (FT.lk-style)
+        if: matrix.incremental == true
+        working-directory: timeTwister
+        env:
+          SCRAPE_MODE: incremental
+          CI: "true"
+        run: python scrapers/${{ matrix.module }}.py --incremental
+
+      - name: Run date-range scraper (xvfb)
+        if: matrix.incremental != true
+        working-directory: timeTwister
+        env:
+          CI: "true"
+        run: xvfb-run -a python scrapers/${{ matrix.module }}.py
+
+      - name: Show article count
+        if: always()
+        run: |
+          python -c "
+          import json, os
+          p = 'timeTwister/data/${{ matrix.data_file }}'
+          if os.path.isfile(p):
+              print('${{ matrix.id }}:', len(json.load(open(p, encoding='utf-8'))), 'articles')
+          else:
+              print('${{ matrix.id }}: missing', p)
+          "
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: data-${{ matrix.id }}
+          path: |
+            timeTwister/data/${{ matrix.data_file }}
+            timeTwister/data/*checkpoint*.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  commit-data:
+    name: Commit merged data
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always() && (needs.scrape.result == 'success' || needs.scrape.result == 'failure')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: .
+          pattern: data-*
+          merge-multiple: true
+
+      - name: Commit and push data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f timeTwister/data/*.json || true
+          git status
+          if git diff --cached --quiet; then
+            echo "No data changes."
+          else
+            git commit -m "chore: scrape all outlets $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
