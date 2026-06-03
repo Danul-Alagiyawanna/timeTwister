@@ -17,8 +17,21 @@ from incremental import (
     is_incremental_mode,
     get_last_scraped_checkpoint,
     is_last_scraped_article,
+    load_known_links,
     save_replace_only,
     normalize_link,
+)
+
+# List pages for incremental (page 1 each) and date-range main()
+FTLK_LIST_CATEGORIES: tuple[tuple[str, str], ...] = (
+    ("top-story", "26"),
+    ("news", "44"),  # Front Page
+    ("business-news", "34"),
+    ("news", "56"),
+    ("opinion", "14"),
+    ("columns", "18"),
+    ("sports", "23"),
+    ("travel-tourism", "27"),
 )
 
 
@@ -89,7 +102,12 @@ def get_list_entries_from_page(driver, url):
         all_links = soup.find_all('a', href=True)
         for link_tag in all_links:
             href = link_tag['href']
-            if ('/news/' in href or '/front-page/' in href or '/business/' in href) and href.count('/') >= 3:
+            if (
+                '/news/' in href
+                or '/front-page/' in href
+                or '/top-story/' in href
+                or '/business/' in href
+            ) and href.count('/') >= 3:
                 title = link_tag.get_text(strip=True)
                 if title and len(title) > 10:
                     if href.startswith('/'):
@@ -546,7 +564,12 @@ def get_articles_from_page(driver, url, start_date, end_date):
             all_links = soup.find_all('a', href=True)
             for link_tag in all_links:
                 href = link_tag['href']
-                if ('/news/' in href or '/front-page/' in href) and href.count('/') >= 3:
+                if (
+                    '/news/' in href
+                    or '/front-page/' in href
+                    or '/top-story/' in href
+                    or '/business/' in href
+                ) and href.count('/') >= 3:
                     title = link_tag.get_text(strip=True)
                     if title and len(title) > 10:  # Reasonable title length
                         if href.startswith('/'):
@@ -657,24 +680,15 @@ def main_incremental():
 
     driver = _create_driver(headless=True)
 
-    categories = [
-        ("business-news", "34"),
-        ("news", "44"),
-        ("news", "56"),
-        ("opinion", "14"),
-        ("columns", "18"),
-        ("sports", "23"),
-        ("travel-tourism", "27"),
-    ]
+    known_previous = load_known_links(json_filename)
+    if known_previous:
+        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
 
     new_articles = []
     seen_this_run = set()
-    stop_all = False
 
     try:
-        for cat_name, cat_id in categories:
-            if stop_all:
-                break
+        for cat_name, cat_id in FTLK_LIST_CATEGORIES:
             page_url = f"https://www.ft.lk/{cat_name}/{cat_id}"
             print(f"\n{'=' * 60}")
             print(f"[INCREMENTAL] Category: {cat_name}/{cat_id}")
@@ -689,10 +703,12 @@ def main_incremental():
                 norm = normalize_link(link)
 
                 if is_last_scraped_article(link, checkpoint_link):
-                    print(f"\n[INCREMENTAL] Reached last scraped article — stopping.")
+                    print(f"\n[INCREMENTAL] Reached checkpoint on {cat_name}/{cat_id} — next section.")
                     print(f"             {link}")
-                    stop_all = True
                     break
+
+                if norm in known_previous:
+                    continue
 
                 if norm in seen_this_run:
                     continue
@@ -726,10 +742,12 @@ def main_incremental():
 
                 if bootstrap and len(new_articles) >= bootstrap_limit:
                     print(f"\n[INCREMENTAL] Bootstrap limit ({bootstrap_limit}) reached.")
-                    stop_all = True
                     break
 
                 time.sleep(0.5)
+
+            if bootstrap and len(new_articles) >= bootstrap_limit:
+                break
     finally:
         driver.quit()
 
@@ -765,19 +783,10 @@ def main(start_date=None, end_date=None, scrape_mode="all"):
     total_articles_in_range = 0
     total_articles_outside_range = 0
     
-    categories = [
-        ("business-news", "34"),
-        ("news", "44"),
-        ("news", "56"),
-        ("opinion", "14"),
-        ("columns", "18"),
-        ("sports", "23"),
-        ("travel-tourism", "27")
-    ]
     scraped_urls = set()
     
     try:
-        for cat_name, cat_id in categories:
+        for cat_name, cat_id in FTLK_LIST_CATEGORIES:
             cat_url = f"https://www.ft.lk/{cat_name}/{cat_id}"
             print(f"\n{'='*60}")
             print(f"[INFO] Scraping category: {cat_name}/{cat_id} ({cat_url})")
