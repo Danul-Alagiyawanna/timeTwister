@@ -1052,7 +1052,7 @@ def main_incremental():
         fetch_article=fetch_article_incremental,
         create_driver=create_driver,
         use_undetected=False,
-        save_mode="merge",
+        save_mode="replace",
         sleep_between_articles=1.0,
         sleep_after_list_page=2.0,
     )

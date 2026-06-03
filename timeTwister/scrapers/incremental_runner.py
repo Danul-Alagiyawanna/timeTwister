@@ -227,6 +227,13 @@ def run_incremental_scraper(
     finally:
         driver.quit()
 
+    # Drop empty shells (failed article-page extract on CI)
+    new_articles = [
+        a
+        for a in new_articles
+        if (a.get("title") or "").strip() or (a.get("summary") or a.get("description") or "").strip()
+    ]
+
     print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
     if save_mode == "merge":
         merge_and_save(json_path, new_articles)
