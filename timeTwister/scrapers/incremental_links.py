@@ -68,31 +68,58 @@ def collect_dailymirror_links(driver: Any, url: str) -> list[str]:
     return links
 
 
+def _economynext_fetch_with_cffi(url: str) -> "BeautifulSoup | None":
+    """Fetch EconomyNext page using curl_cffi (Chrome TLS fingerprint → bypasses Cloudflare)."""
+    try:
+        from curl_cffi import requests as cf_requests  # type: ignore
+
+        resp = cf_requests.get(
+            url,
+            impersonate="chrome",
+            timeout=30,
+            headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        if resp.status_code == 200:
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.IGNORECASE | re.DOTALL)
+            title = (title_match.group(1) if title_match else "").strip()
+            if "just a moment" in title.lower():
+                print(f"[WARN] curl_cffi also got Cloudflare challenge for {url}")
+                return None
+            print(f"[INFO] curl_cffi fetched {url} OK (status 200, title: {title[:60]!r})")
+            return BeautifulSoup(resp.text, "html.parser")
+        print(f"[WARN] curl_cffi got status {resp.status_code} for {url}")
+        return None
+    except ImportError:
+        print("[WARN] curl_cffi not installed — cannot bypass Cloudflare from this IP")
+        return None
+    except Exception as e:
+        print(f"[WARN] curl_cffi failed for {url}: {e}")
+        return None
+
+
 def _economynext_is_blocked(driver: Any) -> bool:
     """Return True when Cloudflare is serving a challenge instead of real content."""
     try:
         title = driver.title or ""
         if "just a moment" in title.lower() or "checking your browser" in title.lower():
-            print(f"[WARN] EconomyNext Cloudflare block detected (title: {title!r})")
+            print(f"[WARN] EconomyNext Cloudflare block via Selenium (title: {title!r})")
             return True
-        # Also check if there are basically no economynext.com article links at all
-        source_snippet = (driver.page_source or "")[:500]
+        source_snippet = (driver.page_source or "")[:600]
         if "challenge" in source_snippet.lower() and "economynext" not in source_snippet.lower():
-            print("[WARN] EconomyNext: Cloudflare challenge page detected in source")
+            print("[WARN] EconomyNext: Cloudflare challenge page in source")
             return True
+        # No article links at all → also blocked
+        if not re.search(r"economynext\.com/[^\"']+?-\d+", source_snippet):
+            all_links = re.findall(r'href=["\']([^"\']+)["\']', source_snippet)
+            if len(all_links) < 5:
+                print(f"[WARN] EconomyNext: suspiciously few links ({len(all_links)}) — likely blocked")
+                return True
     except Exception:
         pass
     return False
 
 
-def collect_economynext_homepage_links(driver: Any, _url: str) -> list[str]:
-    _navigate(driver, "https://economynext.com/", 5)
-
-    if _economynext_is_blocked(driver):
-        print("[WARN] EconomyNext homepage blocked by Cloudflare on this IP — returning []")
-        return []
-
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+def _parse_economynext_article_links(soup: "BeautifulSoup") -> list[str]:
     links_with_ids: list[tuple[str, int]] = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -106,18 +133,58 @@ def collect_economynext_homepage_links(driver: Any, _url: str) -> list[str]:
             if (href, pid) not in links_with_ids:
                 links_with_ids.append((href, pid))
     if not links_with_ids:
-        print(f"[WARN] EconomyNext: 0 article links found (page title: {driver.title!r})")
         return []
     threshold = max(pid for _, pid in links_with_ids) - 800
     return [u for u, pid in links_with_ids if pid >= threshold]
+
+
+def collect_economynext_homepage_links(driver: Any, _url: str) -> list[str]:
+    url = "https://economynext.com/"
+    _navigate(driver, url, 5)
+
+    if _economynext_is_blocked(driver):
+        print("[INFO] EconomyNext: Selenium blocked — trying curl_cffi fallback...")
+        soup = _economynext_fetch_with_cffi(url)
+        if soup is None:
+            return []
+        links = _parse_economynext_article_links(soup)
+        print(f"[INFO] curl_cffi found {len(links)} article links on homepage")
+        return links
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    links = _parse_economynext_article_links(soup)
+    if not links:
+        print(f"[WARN] EconomyNext: 0 article links via Selenium (title: {driver.title!r})")
+        print("[INFO] Trying curl_cffi fallback...")
+        soup2 = _economynext_fetch_with_cffi(url)
+        if soup2:
+            links = _parse_economynext_article_links(soup2)
+            print(f"[INFO] curl_cffi found {len(links)} article links")
+    return links
 
 
 def collect_economynext_list_links(driver: Any, url: str) -> list[str]:
     _navigate(driver, url, 3)
 
     if _economynext_is_blocked(driver):
-        print("[WARN] EconomyNext more-news blocked by Cloudflare on this IP — returning []")
-        return []
+        print("[INFO] EconomyNext more-news: Selenium blocked — trying curl_cffi fallback...")
+        soup = _economynext_fetch_with_cffi(url)
+        if soup is None:
+            return []
+        # more-news page: cards have class story-grid-single-story
+        links: list[str] = []
+        for card in soup.find_all(class_="story-grid-single-story"):
+            a = card.find("a", href=True)
+            if a:
+                href = a["href"]
+                if href.startswith("/"):
+                    href = "https://economynext.com" + href
+                links.append(href)
+        if not links:
+            # fallback: any economynext article link
+            links = _parse_economynext_article_links(soup)
+        print(f"[INFO] curl_cffi found {len(links)} links on more-news")
+        return links
 
     try:
         WebDriverWait(driver, 20).until(
@@ -126,7 +193,7 @@ def collect_economynext_list_links(driver: Any, url: str) -> list[str]:
     except Exception:
         print(f"[WARN] EconomyNext more-news: story-grid-single-story not found (title: {driver.title!r})")
         return []
-    links: list[str] = []
+    links = []
     for card in driver.find_elements(By.CLASS_NAME, "story-grid-single-story"):
         try:
             heading = card.find_element(By.CSS_SELECTOR, "h3.recent-top-header a")
