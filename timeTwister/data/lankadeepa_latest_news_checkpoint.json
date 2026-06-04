@@ -1,27 +1,35 @@
 {
-  "last_scraped_link": "https://www.lankadeepa.lk/latest_news/%E0%B6%85%E0%B6%B7%E0%B6%BA%E0%B6%9C-%E0%B7%80%E0%B6%BD%E0%B7%80-%E0%B6%B6%E0%B6%AF-%E0%B7%80%E0%B6%B1-%E0%B6%B1%E0%B7%80-%E0%B6%89%E0%B6%B8/1-693102",
-  "last_scraped_title": "අභියෝග වෙලාවේ බෙදී වෙන් නොවී ඉමු",
-  "updated_at": "2026-06-04T10:49:02.380279+00:00",
+  "last_scraped_link": "https://www.lankadeepa.lk/news/%E0%B6%B8%E0%B6%AD%E0%B6%BB%E0%B6%A7-%E0%B7%80%E0%B6%A9-%E0%B6%85%E0%B6%B1%E0%B6%BB-%E0%B6%B4%E0%B6%B1%E0%B6%AD-%E0%B7%83%E0%B6%B8%E0%B6%B8%E0%B6%AD-%E0%B6%9A%E0%B6%BB%E0%B6%BD/101-693101",
+  "last_scraped_title": "මෛත්‍රීට වඩා අනුර පනත් සම්මත කරලා",
+  "updated_at": "2026-06-04T19:02:58.553353+00:00",
   "sections": {
     "latest": {
-      "last_scraped_link": "https://www.lankadeepa.lk/latest_news/%E0%B6%85%E0%B6%B7%E0%B6%BA%E0%B6%9C-%E0%B7%80%E0%B6%BD%E0%B7%80-%E0%B6%B6%E0%B6%AF-%E0%B7%80%E0%B6%B1-%E0%B6%B1%E0%B7%80-%E0%B6%89%E0%B6%B8/1-693102",
-      "last_scraped_title": "අභියෝග වෙලාවේ බෙදී වෙන් නොවී ඉමු"
+      "last_scraped_link": "https://www.lankadeepa.lk/latest_news/%E0%B7%83%E0%B6%BD%E0%B6%9C-%E0%B6%89%E0%B6%BD%E0%B6%BD%E0%B6%B8%E0%B6%A7-%E0%B6%B1%E0%B6%BA%E0%B6%9C%E0%B6%BA-%E0%B6%9A%E0%B6%BD-%E0%B6%BA%E0%B6%BA/1-693113",
+      "last_scraped_title": "සලේගේ ඉල්ලීමට නියෝගය කල් යයි"
     },
     "features": {
       "last_scraped_link": "https://www.lankadeepa.lk/visheshanga/%E0%B6%B4%E0%B6%BB%E0%B6%B0%E0%B6%B1-%E0%B6%B6%E0%B7%83-%E0%B6%B1%E0%B7%80%E0%B6%AD%E0%B6%B8%E0%B6%B4%E0%B7%85%E0%B6%9A%E0%B6%A7-%E0%B6%9C%E0%B6%BA-%E0%B7%83%E0%B7%84%E0%B6%BB%E0%B6%A2%E0%B6%BA-%E0%B6%AD%E0%B6%BB%E0%B6%AD%E0%B6%BB/26-693087",
-      "last_scraped_title": ""
+      "last_scraped_title": "ප්‍රධාන බස් නැවතුම්පළකට ගිය සිංහරාජයේ තොරතුරු"
     },
     "politics": {
-      "last_scraped_link": "https://www.lankadeepa.lk/news/%E0%B6%8B%E0%B7%83%E0%B7%83-%E0%B6%85%E0%B6%B0%E0%B6%BA%E0%B6%B4%E0%B6%B1%E0%B6%BA%E0%B6%A7%E0%B6%AD-%E0%B6%AF%E0%B7%80%E0%B6%B1%E0%B6%AD-%E0%B7%80%E0%B6%B1%E0%B7%83%E0%B6%9A/101-691756",
-      "last_scraped_title": ""
+      "last_scraped_link": "https://www.lankadeepa.lk/politics/%E0%B6%8B%E0%B7%83%E0%B7%83-%E0%B6%85%E0%B6%B0%E0%B6%BA%E0%B6%B4%E0%B6%B1%E0%B6%BA%E0%B6%A7%E0%B6%AD-%E0%B6%AF%E0%B7%80%E0%B6%B1%E0%B6%AD-%E0%B7%80%E0%B6%B1%E0%B7%83%E0%B6%9A/13-691756",
+      "last_scraped_title": "උසස් අධ්‍යාපනයටත් දැවැන්ත වෙනසක්"
+    },
+    "sports": {
+      "last_scraped_link": "https://www.lankadeepa.lk/news/%E0%B6%B8%E0%B6%AD%E0%B6%BB%E0%B6%A7-%E0%B7%80%E0%B6%A9-%E0%B6%85%E0%B6%B1%E0%B6%BB-%E0%B6%B4%E0%B6%B1%E0%B6%AD-%E0%B7%83%E0%B6%B8%E0%B6%B8%E0%B6%AD-%E0%B6%9A%E0%B6%BB%E0%B6%BD/101-693101",
+      "last_scraped_title": "මෛත්‍රීට වඩා අනුර පනත් සම්මත කරලා"
     },
     "provincial": {
       "last_scraped_link": "https://www.lankadeepa.lk/business/LOLC-%E0%B7%83%E0%B6%B8%E0%B7%84%E0%B6%BA-%E0%B7%81%E0%B6%9A%E0%B6%AD%E0%B6%B8%E0%B6%AD-%E0%B7%80%E0%B6%BB%E0%B6%B0%E0%B6%B1%E0%B6%BA%E0%B6%9A/9-693023",
-      "last_scraped_title": ""
+      "last_scraped_title": "LOLC සමූහයේ ශක්තිමත් වර්ධනයක්"
+    },
+    "world": {
+      "last_scraped_link": "https://www.lankadeepa.lk/news/%E0%B6%B8%E0%B6%AD%E0%B6%BB%E0%B6%A7-%E0%B7%80%E0%B6%A9-%E0%B6%85%E0%B6%B1%E0%B6%BB-%E0%B6%B4%E0%B6%B1%E0%B6%AD-%E0%B7%83%E0%B6%B8%E0%B6%B8%E0%B6%AD-%E0%B6%9A%E0%B6%BB%E0%B6%BD/101-693101",
+      "last_scraped_title": "මෛත්‍රීට වඩා අනුර පනත් සම්මත කරලා"
     },
     "editorial": {
       "last_scraped_link": "https://www.lankadeepa.lk/deyyo_sakki/%E0%B6%9A%E0%B6%9A-%E0%B6%AF%E0%B6%B1%E0%B6%B1-%E0%B6%9C%E0%B7%84%E0%B6%B1-%E0%B6%B1%E0%B6%B1%E0%B6%A9-%E0%B7%80%E0%B6%BD/15-693075",
-      "last_scraped_title": ""
+      "last_scraped_title": "කොකු දාන්න  ගිහින්  නෝන්ඩි වෙලා"
     }
   }
 }
