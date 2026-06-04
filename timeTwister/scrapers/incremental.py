@@ -151,14 +151,38 @@ def migrate_global_checkpoint_to_sections(
 def _title_for_article_link(
     link: str,
     scraped_articles: list[dict[str, Any]],
-    *,
-    fallback_title: str = "",
 ) -> str:
     norm = normalize_link(link)
     for article in scraped_articles:
         if normalize_link(article.get("link", "")) == norm:
             return (article.get("title") or "").strip()
-    return fallback_title
+    return ""
+
+
+def title_for_checkpoint_link(
+    link: str,
+    scraped_articles: list[dict[str, Any]],
+    articles_json_path: str,
+    *,
+    section_checkpoint_link: str | None = None,
+    section_checkpoint_title: str | None = None,
+) -> str:
+    """Title for a checkpoint URL — never reuse another section's title."""
+    title = _title_for_article_link(link, scraped_articles)
+    if title:
+        return title
+    if (
+        section_checkpoint_link
+        and section_checkpoint_title
+        and normalize_link(link) == normalize_link(section_checkpoint_link)
+    ):
+        return section_checkpoint_title.strip()
+    for item in _load_articles_list(articles_json_path):
+        if not isinstance(item, dict):
+            continue
+        if normalize_link(item.get("link", "")) == normalize_link(link):
+            return (item.get("title") or "").strip()
+    return ""
 
 
 def filter_cross_section_promo_links(
@@ -215,7 +239,7 @@ def apply_section_head_checkpoints(
             if not links:
                 continue
             head_url = link_transform(links[0]) if link_transform else links[0]
-            head_title = _title_for_article_link(head_url, articles)
+            head_title = title_for_checkpoint_link(head_url, articles, articles_json_path)
             updates[name] = (head_url, head_title)
 
     if updates:

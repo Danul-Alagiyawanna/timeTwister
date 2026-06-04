@@ -27,7 +27,7 @@ from incremental import (
     apply_section_head_checkpoints,
     filter_cross_section_promo_links,
     migrate_global_checkpoint_to_sections,
-    _title_for_article_link,
+    title_for_checkpoint_link,
     normalize_link,
     save_replace_only,
     should_stop_at_feed_item,
@@ -506,24 +506,40 @@ def _run_incremental_scraper_per_section(
             if stopped_at:
                 section_checkpoint_updates[name] = (
                     stopped_at,
-                    _title_for_article_link(
+                    title_for_checkpoint_link(
                         stopped_at,
                         new_articles,
-                        fallback_title=sec_ckpt_title or "",
+                        json_path,
+                        section_checkpoint_link=sec_ckpt,
+                        section_checkpoint_title=sec_ckpt_title,
                     ),
                 )
             elif page_new > 0 and links:
                 head = links[0]
                 section_checkpoint_updates[name] = (
                     head,
-                    _title_for_article_link(head, new_articles),
+                    title_for_checkpoint_link(
+                        head,
+                        new_articles,
+                        json_path,
+                    ),
                 )
             elif sec_ckpt:
-                section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title or "")
-            elif links:
                 section_checkpoint_updates[name] = (
-                    links[0],
-                    _title_for_article_link(links[0], new_articles),
+                    sec_ckpt,
+                    title_for_checkpoint_link(
+                        sec_ckpt,
+                        new_articles,
+                        json_path,
+                        section_checkpoint_link=sec_ckpt,
+                        section_checkpoint_title=sec_ckpt_title,
+                    ),
+                )
+            elif links:
+                head = links[0]
+                section_checkpoint_updates[name] = (
+                    head,
+                    title_for_checkpoint_link(head, new_articles, json_path),
                 )
 
         apply_section_head_checkpoints(
