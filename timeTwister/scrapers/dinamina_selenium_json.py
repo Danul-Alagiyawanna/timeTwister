@@ -827,16 +827,38 @@ def _link_to_section(link: str) -> str | None:
 
 
 def _http_get(url: str, **kwargs):
-    """requests + curl_cffi fallback (works on GHA for /feed/)."""
+    """curl_cffi first (GHA Cloudflare), then requests."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        "Accept-Language": "en-US,en;q=0.9,si;q=0.8",
+        "Referer": "https://www.dinamina.lk/",
     }
     import requests as req
+
+    cf_import_error = None
+    for profile in ("chrome124", "chrome120", "safari17_0", "firefox133"):
+        try:
+            from curl_cffi import requests as cf_req  # type: ignore
+
+            r = cf_req.get(
+                url, impersonate=profile, timeout=25, headers=headers, **kwargs
+            )
+            if r.status_code == 200 and len(r.text) > 200:
+                print(f"[INFO] curl_cffi ({profile}) OK for {url}")
+                return r
+            print(f"[WARN] curl_cffi ({profile}) {r.status_code} for {url}")
+        except ImportError as e:
+            cf_import_error = e
+            break
+        except Exception as e:
+            print(f"[WARN] curl_cffi ({profile}): {e}")
+
+    if cf_import_error:
+        print(f"[WARN] curl_cffi not installed: {cf_import_error}")
 
     try:
         r = req.get(url, timeout=20, allow_redirects=True, headers=headers, **kwargs)
@@ -845,27 +867,67 @@ def _http_get(url: str, **kwargs):
         print(f"[WARN] requests {r.status_code} for {url}")
     except Exception as e:
         print(f"[WARN] requests failed: {e}")
-    for profile in ("chrome124", "safari17_0", "firefox133"):
-        try:
-            from curl_cffi import requests as cf_req  # type: ignore
-
-            r = cf_req.get(url, impersonate=profile, timeout=20, headers=headers, **kwargs)
-            if r.status_code == 200 and len(r.text) > 200:
-                print(f"[INFO] curl_cffi ({profile}) OK for {url}")
-                return r
-        except Exception as e:
-            print(f"[WARN] curl_cffi ({profile}): {e}")
-            break
     return None
+
+
+def _is_dinamina_article_url(link: str) -> bool:
+    if not link or "dinamina.lk" not in link:
+        return False
+    if "epaper." in link or "archives." in link:
+        return False
+    return bool(_ARTICLE_PATH_RE.search(link))
+
+
+def _decode_gnews_url(gnews_url: str) -> str:
+    """Best-effort decode of Google News redirect URLs to dinamina.lk article URL."""
+    import base64 as b64_mod
+
+    m = re.search(r"/articles/([^?&#]+)", gnews_url)
+    if not m:
+        return gnews_url
+    try:
+        padded = m.group(1) + "=" * (-len(m.group(1)) % 4)
+        raw = b64_mod.urlsafe_b64decode(padded)
+        for pat in (
+            rb"https?://(?:www\.)?dinamina\.lk/20\d{2}/\d{2}/\d{2}/[^\x00-\x20\"'<>]+",
+            rb"https?://(?:www\.)?dinamina\.lk/20\d{2}/[^\x00-\x20\"'<>]+",
+        ):
+            fm = re.search(pat, raw)
+            if fm:
+                return fm.group(0).decode("utf-8", errors="ignore").rstrip(".")
+        text = raw.decode("utf-8", errors="ignore")
+        um = re.search(
+            r"https?://(?:www\.)?dinamina\.lk/20\d{2}/\d{2}/\d{2}/[^\s\"'<>]+",
+            text,
+        )
+        if um:
+            return um.group(0).rstrip(".")
+    except Exception:
+        pass
+    return gnews_url
 
 
 def _html_to_plain(html: str) -> str:
     if not html:
         return ""
     try:
-        return BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
+        text = BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
     except Exception:
-        return html.strip()
+        text = html.strip()
+    return _strip_rss_boilerplate(text)
+
+
+def _strip_rss_boilerplate(text: str) -> str:
+    """Remove WordPress 'The post X appeared first on Y' footer from RSS bodies."""
+    if not text:
+        return ""
+    cut = re.split(
+        r"The post .+ appeared first on ",
+        text,
+        maxsplit=1,
+        flags=re.I,
+    )
+    return cut[0].strip()
 
 
 def _first_img_from_html(html: str) -> str:
@@ -926,9 +988,13 @@ def _parse_dinamina_rss(xml_text: str) -> list[dict]:
     }
     articles: list[dict] = []
     root = ET.fromstring(xml_text)
-    for item in root.findall(".//item"):
+    # channel/item only — avoid nested comment feeds
+    items = root.findall("./channel/item") or root.findall(".//item")
+    for item in items:
         link = (item.findtext("link") or "").strip()
         if not link or "dinamina.lk" not in link:
+            continue
+        if not _is_dinamina_article_url(link):
             continue
         title = (item.findtext("title") or "").strip()
         pub_date = (item.findtext("pubDate") or "").strip()
@@ -978,96 +1044,30 @@ def _parse_dinamina_rss(xml_text: str) -> list[dict]:
 
 
 def _fetch_dinamina_feed_articles() -> list[dict]:
-    """Main site RSS + Google News fallback (no Cloudflare browser needed)."""
-    import base64 as b64_mod
-
-    feed_url = "https://www.dinamina.lk/feed/"
-    resp = _http_get(feed_url)
-    if resp:
-        print(f"[INFO] RSS fetched ({len(resp.text)} bytes)")
+    """Main site RSS (curl_cffi on GHA). Only real /YYYY/MM/DD/... article URLs."""
+    for feed_url in (
+        "https://www.dinamina.lk/feed/",
+        "https://dinamina.lk/feed/",
+    ):
+        resp = _http_get(feed_url)
+        if not resp:
+            continue
+        if "just a moment" in resp.text.lower()[:8000]:
+            print(f"[WARN] Cloudflare interstitial on {feed_url}")
+            continue
+        print(f"[INFO] RSS fetched {feed_url} ({len(resp.text)} bytes)")
         try:
             items = _parse_dinamina_rss(resp.text)
-            if items:
-                print(f"[INFO] RSS parsed {len(items)} items")
-                return items
+            valid = [a for a in items if _is_dinamina_article_url(a.get("link", ""))]
+            if valid:
+                print(f"[INFO] RSS parsed {len(valid)} article URL(s)")
+                return valid
+            print(f"[WARN] RSS had {len(items)} items but 0 article URLs")
         except Exception as e:
             print(f"[WARN] RSS parse error: {e}")
 
-    print("[INFO] RSS unavailable — trying Google News RSS...")
-    gnews = (
-        "https://news.google.com/rss/search?q=site:dinamina.lk&hl=en-US&gl=US&ceid=US:en"
-    )
-    resp = _http_get(gnews)
-    if not resp:
-        return []
-
-    def _decode_gnews_url(gnews_url: str) -> str:
-        m = re.search(r"/articles/([^?&#]+)", gnews_url)
-        if not m:
-            return gnews_url
-        try:
-            padded = m.group(1) + "=" * (-len(m.group(1)) % 4)
-            raw = b64_mod.urlsafe_b64decode(padded)
-            urls = re.findall(rb"https?://[^\x00-\x1f\x7f-\xff ]+", raw)
-            if urls:
-                return urls[0].decode("utf-8").rstrip(".")
-        except Exception:
-            pass
-        return gnews_url
-
-    import xml.etree.ElementTree as ET
-    from email.utils import parsedate_to_datetime
-
-    items_out: list[dict] = []
-    root = ET.fromstring(resp.text)
-    for item in root.findall(".//item"):
-        gnews_link = (item.findtext("link") or "").strip()
-        link = _decode_gnews_url(gnews_link)
-        if "dinamina.lk" not in link:
-            link = gnews_link
-        title = (item.findtext("title") or "").strip()
-        pub_date = (item.findtext("pubDate") or "").strip()
-        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if pub_date:
-            try:
-                date_str = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
-        desc_html = (item.findtext("description") or "").strip()
-        desc_text = _html_to_plain(desc_html)
-        image_url = _first_img_from_html(desc_html)
-        # Enrich from article page when not Cloudflare-blocked
-        if "dinamina.lk" in link and (not desc_text or not image_url):
-            page = _http_get(link)
-            if page and "just a moment" not in page.text.lower():
-                psoup = BeautifulSoup(page.text, "html.parser")
-                if not desc_text:
-                    for sel in (
-                        "article .entry-content",
-                        ".entry-content",
-                        "article",
-                    ):
-                        block = psoup.select_one(sel)
-                        if block:
-                            desc_text = block.get_text(separator="\n", strip=True)
-                            if desc_text:
-                                break
-                if not image_url:
-                    og = psoup.find("meta", property="og:image")
-                    if og and og.get("content"):
-                        image_url = og["content"].strip()
-        items_out.append(
-            _build_dinamina_article_row(
-                title=title,
-                link=link,
-                date_str=date_str,
-                body_text=desc_text,
-                image_url=image_url,
-                date_source=f"GNews: {date_str}",
-            )
-        )
-    print(f"[INFO] Google News RSS returned {len(items_out)} items")
-    return items_out
+    print("[WARN] Dinamina /feed/ blocked or empty — no Google News fallback (no article URLs there)")
+    return []
 
 
 def main_incremental_rss() -> int:
@@ -1089,64 +1089,75 @@ def main_incremental_rss() -> int:
 
     all_feed = _fetch_dinamina_feed_articles()
     if not all_feed:
-        print("[ERROR] No feed items — saving empty list")
+        print("[ERROR] No Dinamina article URLs from RSS — saving empty list")
         save_replace_only(json_filename, [])
         return 0
 
     section_links: dict[str, list[str]] = {k: [] for k in section_keys}
-    section_articles: dict[str, list[dict]] = {k: [] for k in section_keys}
     for art in all_feed:
         sec = _link_to_section(art.get("link", ""))
         if sec and sec in section_links:
             section_links[sec].append(art["link"])
-            section_articles[sec].append(art)
 
     for name in section_keys:
         print(f"[PHASE 1] {name}: {len(section_links[name])} links from feed")
+    print(f"[PHASE 1] total in feed: {len(all_feed)} articles")
 
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
+    section_stopped: set[str] = set()
     cap_hit = False
 
-    for name, _url in DINAMINA_CATEGORIES:
+    print("\n[PHASE 2] RSS feed order (newest first, per-section stop)")
+    for i, art in enumerate(all_feed, 1):
         if cap_hit:
             break
-        arts = section_articles.get(name, [])
-        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
-        print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
+        link = art["link"]
+        norm = normalize_link(link)
+        sec = _link_to_section(link)
+        if not sec:
+            continue
+        if sec in section_stopped:
+            continue
 
-        for i, art in enumerate(arts, 1):
-            link = art["link"]
-            norm = normalize_link(link)
-            if sec_ckpt and normalize_link(sec_ckpt) == norm:
-                print("  [STOP] Reached section checkpoint")
-                break
-            if norm in known_previous:
-                print(f"  [STOP] Already in previous run: {link[:70]}")
-                break
-            if norm in seen_this_run:
-                continue
-            if not art.get("title") and not art.get("description") and not art.get("summary"):
-                print(f"  [SKIP] Empty row: {link[:80]}")
-                continue
+        sec_ckpt, _ = get_section_checkpoint(json_filename, sec)
+        if sec_ckpt and normalize_link(sec_ckpt) == norm:
+            print(f"  [STOP] {sec} reached section checkpoint")
+            section_stopped.add(sec)
+            continue
+        if norm in known_previous:
+            print(f"  [STOP] {sec} already in previous file")
+            section_stopped.add(sec)
+            continue
+        if norm in seen_this_run:
+            continue
+        if not art.get("title") and not art.get("description") and not art.get("summary"):
+            print(f"  [SKIP] Empty row: {link[:80]}")
+            continue
 
-            print(f"\n  [INFO] New {i}: {link[:80]}...")
-            new_articles.append(art)
-            seen_this_run.add(norm)
-            print(f"  [+] {(art.get('title') or '')[:70]}")
+        print(f"  [INFO] New: {link[:80]}...")
+        new_articles.append(art)
+        seen_this_run.add(norm)
+        print(f"  [+] {(art.get('title') or '')[:70]}")
 
-            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
-                label = "Bootstrap" if bootstrap else "Run safety"
-                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
-                cap_hit = True
-                break
+        if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+            label_lim = "Bootstrap" if bootstrap else "Run safety"
+            print(f"[INCREMENTAL] {label_lim} limit ({max_articles}) reached.")
+            cap_hit = True
+            break
 
+    for name in section_keys:
         links = section_links.get(name, [])
-        if links:
-            head_url = links[0]
-            head_title = section_articles[name][0].get("title", "") if section_articles[name] else ""
-            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
-            print(f"  [CKPT] {name} newest in feed: {head_url[:70]}")
+        if not links:
+            continue
+        head_url = links[0]
+        head_title = ""
+        for a in all_feed:
+            if a.get("link") == head_url or normalize_link(a.get("link", "")) == normalize_link(head_url):
+                head_title = a.get("title", "") or ""
+                break
+        update_section_checkpoints(json_filename, {name: (head_url, head_title)})
+        print(f"  [CKPT] {name} newest in feed: {head_url[:70]}")
 
     for name in section_keys:
         sec_ckpt, _ = get_section_checkpoint(json_filename, name)
