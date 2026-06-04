@@ -35,8 +35,11 @@ from incremental import (
     merge_and_save,
     normalize_link,
     reached_incremental_limit,
+    save_replace_only,
     should_stop_at_feed_item,
 )
+
+DIVAINA_ARCHIVE_JSON = "divaina_latest_news_archive.json"
 from incremental_runner import article_from_content, data_json_path, run_incremental_scraper
 from incremental_links import collect_divaina_breaking_links, collect_divaina_main_links
 
@@ -1476,10 +1479,37 @@ def _fetch_divaina_feed_articles() -> list[dict]:
     return []
 
 
+def _divaina_archive_path() -> str:
+    return data_json_path(DIVAINA_ARCHIVE_JSON)
+
+
+def _seed_divaina_archive_from_output(output_path: str, archive_path: str) -> None:
+    """One-time: move pre-archive incremental data into the history file."""
+    if os.path.isfile(archive_path):
+        return
+    try:
+        with open(output_path, encoding="utf-8") as f:
+            existing = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(existing, list) or not existing:
+        return
+    os.makedirs(os.path.dirname(archive_path) or ".", exist_ok=True)
+    with open(archive_path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+    print(
+        f"[INCREMENTAL] Seeded archive with {len(existing)} article(s) → {archive_path}"
+    )
+
+
 def main_incremental_rss() -> int:
     """Global checkpoint via site RSS (GHA — article pages block plain Selenium)."""
     json_filename = data_json_path("divaina_latest_news.json")
-    checkpoint_link, known_previous = load_incremental_boundary_links(json_filename)
+    archive_filename = _divaina_archive_path()
+    _seed_divaina_archive_from_output(json_filename, archive_filename)
+    checkpoint_link, known_previous = load_incremental_boundary_links(
+        json_filename, archive_json_path=archive_filename
+    )
     bootstrap = not checkpoint_link
     max_articles = incremental_fetch_limit(bootstrap=bootstrap)
 
@@ -1544,9 +1574,18 @@ def main_incremental_rss() -> int:
 
     print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
     if new_articles:
-        merge_and_save(json_filename, new_articles)
+        merge_and_save(archive_filename, new_articles)
+        save_replace_only(json_filename, new_articles)
+        print(
+            f"[INCREMENTAL] Archive: {archive_filename} | "
+            f"Pipeline delta: {len(new_articles)} → {json_filename}"
+        )
     else:
-        print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
+        save_replace_only(json_filename, [])
+        print(
+            "[INCREMENTAL] No new articles — pipeline file cleared ([]); "
+            "archive unchanged"
+        )
     return len(new_articles)
 
 

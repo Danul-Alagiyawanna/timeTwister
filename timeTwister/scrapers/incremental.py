@@ -276,13 +276,21 @@ def load_known_links(json_path: str) -> set[str]:
 
 def load_incremental_boundary_links(
     json_path: str,
+    *,
+    archive_json_path: str | None = None,
 ) -> tuple[str | None, set[str]]:
     """
     Normalized checkpoint URL plus every URL already stored (including checkpoint).
     Used on newest-first feeds so we stop instead of skipping with continue.
+
+    archive_json_path: optional full-history file (delta output may be replace-only).
     """
     checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
     known = load_known_links(json_path)
+    if archive_json_path and os.path.normpath(archive_json_path) != os.path.normpath(
+        json_path
+    ):
+        known |= load_known_links(archive_json_path)
     if checkpoint_link:
         known.add(checkpoint_link)
     return checkpoint_link, known

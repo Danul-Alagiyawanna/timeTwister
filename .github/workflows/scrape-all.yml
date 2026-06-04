@@ -106,6 +106,7 @@ jobs:
           path: |
             timeTwister/data/${{ matrix.data_file }}
             timeTwister/data/*_checkpoint.json
+            timeTwister/data/*_archive.json
           key: scrape-${{ matrix.id }}-${{ runner.os }}
           restore-keys: |
             scrape-${{ matrix.id }}-
