@@ -25,16 +25,17 @@ def extract_article_metadata(driver):
         # Extract publication date from meta tag
         date_published = None
         
+        def _parse_iso_date(s: str):
+            # handles: "2026-06-04T00:00:00+00:00Z", "2026-06-04T00:00:00Z", "2026-06-04T00:00:00+00:00"
+            s = s.strip().rstrip('Z')          # drop trailing Z
+            s = s.split('+')[0].split('.')[0]  # drop timezone offset and microseconds
+            return datetime.fromisoformat(s)
+
         # Strategy 1: Try article:published_time meta tag (most reliable)
         date_meta = soup.find('meta', attrs={'property': 'article:published_time'})
         if date_meta and date_meta.has_attr('content'):
             try:
-                # Parse ISO format: "2025-07-19T00:00:00+00:00Z"
-                date_str = date_meta['content']
-                # Handle timezone and Z suffix
-                if date_str.endswith('Z'):
-                    date_str = date_str[:-1] + '+00:00'
-                date_published = datetime.fromisoformat(date_str.replace('Z', ''))
+                date_published = _parse_iso_date(date_meta['content'])
                 print(f"     Found exact date: {date_meta['content']}")
             except ValueError as e:
                 print(f"     Error parsing date '{date_meta['content']}': {e}")
@@ -44,10 +45,7 @@ def extract_article_metadata(driver):
             date_meta = soup.find('meta', attrs={'property': 'article:modified_time'})
             if date_meta and date_meta.has_attr('content'):
                 try:
-                    date_str = date_meta['content']
-                    if date_str.endswith('Z'):
-                        date_str = date_str[:-1] + '+00:00'
-                    date_published = datetime.fromisoformat(date_str.replace('Z', ''))
+                    date_published = _parse_iso_date(date_meta['content'])
                     print(f"     Found date from modified time: {date_meta['content']}")
                 except ValueError as e:
                     print(f"     Error parsing modified date '{date_meta['content']}': {e}")
@@ -146,10 +144,11 @@ def is_article_in_date_range(article_date, start_date, end_date):
 
 def get_main_article_links(driver):
     soup = BeautifulSoup(driver.page_source, 'html.parser')
-    # Find all main news grid containers
-    main_grids = soup.find_all('div', class_=['grid', 'grid-cols-8', 'gap-4', 'mb-10'])
     links = []
     seen = set()
+
+    # Primary: specific grid containers used by news/opinion/business/sports
+    main_grids = soup.find_all('div', class_='grid-cols-8')
     for grid in main_grids:
         for a in grid.find_all('a', href=True):
             href = a['href']
@@ -158,6 +157,17 @@ def get_main_article_links(driver):
                 if full_url not in seen:
                     seen.add(full_url)
                     links.append(full_url)
+
+    # Fallback: any article link on the page (covers features/world different layouts)
+    if not links:
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if href.startswith('/articles/'):
+                full_url = 'https://www.themorning.lk' + href
+                if full_url not in seen:
+                    seen.add(full_url)
+                    links.append(full_url)
+
     return links
 
 def extract_image_url(soup, base_url):
