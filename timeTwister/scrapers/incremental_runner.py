@@ -25,7 +25,9 @@ from incremental import (
     load_known_links,
     merge_and_save,
     apply_section_head_checkpoints,
+    filter_cross_section_promo_links,
     migrate_global_checkpoint_to_sections,
+    _title_for_article_link,
     normalize_link,
     save_replace_only,
     should_stop_at_feed_item,
@@ -444,23 +446,30 @@ def _run_incremental_scraper_per_section(
             if sleep_after_list_page:
                 time.sleep(sleep_after_list_page)
 
+        section_links = filter_cross_section_promo_links(section_links)
+
         print("\n[INCREMENTAL] Phase 2 — fetch new articles per section")
+        section_checkpoint_updates: dict[str, tuple[str, str]] = {}
         for name, _page_url in pages:
             links = section_links.get(name, [])
-            sec_ckpt, _ = get_section_checkpoint(json_path, name)
+            sec_ckpt, sec_ckpt_title = get_section_checkpoint(json_path, name)
             print(
                 f"\n[PHASE 2] {name} — checkpoint: "
                 f"{(sec_ckpt or 'None')[:70]}"
             )
             page_new = 0
+            stopped_at: str | None = None
+            first_new_link: str | None = None
 
             for i, link in enumerate(links, 1):
                 norm = normalize_link(link)
                 if sec_ckpt and norm == normalize_link(sec_ckpt):
                     print("  [STOP] Reached section checkpoint")
+                    stopped_at = link
                     break
                 if norm in known_previous:
                     print(f"  [STOP] Already in previous run: {link[:70]}")
+                    stopped_at = link
                     break
                 if norm in seen_this_run:
                     continue
@@ -479,6 +488,8 @@ def _run_incremental_scraper_per_section(
                         new_articles.append(row)
                         seen_this_run.add(norm)
                         page_new += 1
+                        if first_new_link is None:
+                            first_new_link = link
                 except Exception as e:
                     print(f"[ERROR] Article failed: {e}")
 
@@ -492,11 +503,35 @@ def _run_incremental_scraper_per_section(
 
                 time.sleep(sleep_between_articles)
 
+            if stopped_at:
+                section_checkpoint_updates[name] = (
+                    stopped_at,
+                    _title_for_article_link(
+                        stopped_at,
+                        new_articles,
+                        fallback_title=sec_ckpt_title or "",
+                    ),
+                )
+            elif page_new > 0 and links:
+                head = links[0]
+                section_checkpoint_updates[name] = (
+                    head,
+                    _title_for_article_link(head, new_articles),
+                )
+            elif sec_ckpt:
+                section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title or "")
+            elif links:
+                section_checkpoint_updates[name] = (
+                    links[0],
+                    _title_for_article_link(links[0], new_articles),
+                )
+
         apply_section_head_checkpoints(
             json_path,
             section_links,
             new_articles,
             section_keys=section_keys,
+            section_updates=section_checkpoint_updates,
         )
     finally:
         driver.quit()

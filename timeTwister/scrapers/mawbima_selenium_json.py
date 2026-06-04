@@ -152,24 +152,46 @@ def is_article_in_date_range(article_date, start_date, end_date):
 
 
 
+def _link_in_chrome(tag) -> bool:
+    """Skip header/footer/nav so category checkpoints are not site-wide promos."""
+    for parent in tag.parents:
+        if parent.name in ("header", "footer", "nav"):
+            return True
+        classes = parent.get("class") or []
+        if any(
+            c in classes
+            for c in (
+                "td-header-wrap",
+                "td-footer-wrap",
+                "tdb-header-menu",
+                "td-header-mobile-wrap",
+            )
+        ):
+            return True
+    return False
+
+
 def get_main_article_links(driver):
-    """Article URLs newest-first (by /YYYY/MM/DD/ in path) for incremental checkpoints."""
+    """Category list article URLs in DOM order (newest first on the page)."""
     import re
 
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    root = (
+        soup.select_one(".td-ss-main-content")
+        or soup.select_one("main")
+        or soup.select_one(".td-main-content")
+        or soup.select_one("#main")
+        or soup.body
+    )
     links: list[str] = []
     seen: set[str] = set()
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if re.match(r'^https://mawbima\.lk/\d{4}/\d{2}/\d{2}/', href) and href not in seen:
+    for a in root.find_all("a", href=True):
+        if _link_in_chrome(a):
+            continue
+        href = a["href"]
+        if re.match(r"^https://mawbima\.lk/\d{4}/\d{2}/\d{2}/", href) and href not in seen:
             seen.add(href)
             links.append(href)
-
-    def _date_key(url: str) -> tuple[str, str, str]:
-        m = re.match(r'https://mawbima\.lk/(\d{4})/(\d{2})/(\d{2})/', url)
-        return m.groups() if m else ('', '', '')
-
-    links.sort(key=_date_key, reverse=True)
     return links
 
 def extract_image_url(soup, base_url):

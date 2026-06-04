@@ -148,6 +148,50 @@ def migrate_global_checkpoint_to_sections(
     return True
 
 
+def _title_for_article_link(
+    link: str,
+    scraped_articles: list[dict[str, Any]],
+    *,
+    fallback_title: str = "",
+) -> str:
+    norm = normalize_link(link)
+    for article in scraped_articles:
+        if normalize_link(article.get("link", "")) == norm:
+            return (article.get("title") or "").strip()
+    return fallback_title
+
+
+def filter_cross_section_promo_links(
+    section_links: dict[str, list[str]],
+    *,
+    window: int = 10,
+    min_sections: int = 2,
+) -> dict[str, list[str]]:
+    """
+    Drop URLs that appear near the top of multiple category pages (site-wide promos).
+    """
+    from collections import Counter
+
+    counts: Counter[str] = Counter()
+    for links in section_links.values():
+        seen: set[str] = set()
+        for link in links[:window]:
+            norm = normalize_link(link)
+            if norm and norm not in seen:
+                counts[norm] += 1
+                seen.add(norm)
+    promos = {url for url, n in counts.items() if n >= min_sections}
+    if promos:
+        print(
+            f"[INCREMENTAL] Filtering {len(promos)} cross-section promo URL(s) "
+            f"from category feeds"
+        )
+    return {
+        name: [link for link in links if normalize_link(link) not in promos]
+        for name, links in section_links.items()
+    }
+
+
 def apply_section_head_checkpoints(
     articles_json_path: str,
     section_links: dict[str, list[str]],
@@ -155,26 +199,24 @@ def apply_section_head_checkpoints(
     *,
     section_keys: list[str] | None = None,
     link_transform: Callable[[str], str] | None = None,
+    section_updates: dict[str, tuple[str, str]] | None = None,
 ) -> int:
     """
-    Set each section checkpoint to links[0] (newest on that category list page).
-    Call after Phase 2 so every category that returned links is tracked.
+    Persist per-section checkpoints. Prefer explicit section_updates from Phase 2
+    (stop boundary / newest fetched). Otherwise fall back to links[0] per section.
     """
     keys = section_keys or list(section_links.keys())
     articles = scraped_articles or []
-    updates: dict[str, tuple[str, str]] = {}
-    for name in keys:
-        links = section_links.get(name) or []
-        if not links:
-            continue
-        head_url = link_transform(links[0]) if link_transform else links[0]
-        head_title = ""
-        head_norm = normalize_link(head_url)
-        for article in articles:
-            if normalize_link(article.get("link", "")) == head_norm:
-                head_title = article.get("title", "") or ""
-                break
-        updates[name] = (head_url, head_title)
+    updates: dict[str, tuple[str, str]] = dict(section_updates or {})
+
+    if not section_updates:
+        for name in keys:
+            links = section_links.get(name) or []
+            if not links:
+                continue
+            head_url = link_transform(links[0]) if link_transform else links[0]
+            head_title = _title_for_article_link(head_url, articles)
+            updates[name] = (head_url, head_title)
 
     if updates:
         update_section_checkpoints(articles_json_path, updates)
