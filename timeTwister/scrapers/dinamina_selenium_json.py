@@ -1043,8 +1043,56 @@ def _parse_dinamina_rss(xml_text: str) -> list[dict]:
     return articles
 
 
+def _wait_cloudflare_clear(driver, max_wait: int = 60) -> bool:
+    """Wait until Cloudflare interstitial clears (GHA + local)."""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        title = (driver.title or "").lower()
+        if "just a moment" not in title and "attention required" not in title:
+            return True
+        print("[INFO] Waiting for Cloudflare challenge...")
+        time.sleep(4)
+    return False
+
+
+def _extract_rss_xml_from_html(page_source: str) -> str:
+    m = re.search(r"<\?xml[^>]*\?>.*?</rss>", page_source, re.DOTALL | re.I)
+    if m:
+        return m.group(0)
+    idx = page_source.lower().find("<rss")
+    return page_source[idx:] if idx >= 0 else ""
+
+
+def _fetch_feed_via_selenium() -> list[dict]:
+    """Load /feed/ in UC — often works on GHA when curl gets 403."""
+    print("[INFO] Fetching RSS via browser (undetected Chrome)...")
+    driver = _create_dinamina_driver()
+    driver.set_page_load_timeout(90)
+    try:
+        driver.get("https://www.dinamina.lk/feed/")
+        if not _wait_cloudflare_clear(driver, 75):
+            print("[WARN] Cloudflare still blocking /feed/ in browser")
+            return []
+        xml = _extract_rss_xml_from_html(driver.page_source)
+        if not xml or "<item" not in xml:
+            print(f"[WARN] Browser feed page is not RSS (title={driver.title[:50]!r})")
+            return []
+        items = _parse_dinamina_rss(xml)
+        valid = [a for a in items if _is_dinamina_article_url(a.get("link", ""))]
+        print(f"[INFO] Browser RSS parsed {len(valid)} article URL(s)")
+        return valid
+    except Exception as e:
+        print(f"[ERROR] Browser feed fetch failed: {e}")
+        return []
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
 def _fetch_dinamina_feed_articles() -> list[dict]:
-    """Main site RSS (curl_cffi on GHA). Only real /YYYY/MM/DD/... article URLs."""
+    """Main site RSS — HTTP first, then browser on CI."""
     for feed_url in (
         "https://www.dinamina.lk/feed/",
         "https://dinamina.lk/feed/",
@@ -1066,7 +1114,12 @@ def _fetch_dinamina_feed_articles() -> list[dict]:
         except Exception as e:
             print(f"[WARN] RSS parse error: {e}")
 
-    print("[WARN] Dinamina /feed/ blocked or empty — no Google News fallback (no article URLs there)")
+    if os.getenv("CI", "").lower() in ("1", "true"):
+        valid = _fetch_feed_via_selenium()
+        if valid:
+            return valid
+
+    print("[WARN] Dinamina /feed/ unavailable via HTTP and browser")
     return []
 
 
@@ -1089,9 +1142,8 @@ def main_incremental_rss() -> int:
 
     all_feed = _fetch_dinamina_feed_articles()
     if not all_feed:
-        print("[ERROR] No Dinamina article URLs from RSS — saving empty list")
-        save_replace_only(json_filename, [])
-        return 0
+        print("[ERROR] No Dinamina article URLs from RSS — keeping existing data")
+        return -1
 
     section_links: dict[str, list[str]] = {k: [] for k in section_keys}
     for art in all_feed:
@@ -1201,6 +1253,8 @@ def main_incremental_selenium() -> int:
         print(f"\n[PHASE 1] {name}: {url}")
         try:
             driver.get(url.rstrip("/") + "/")
+            _wait_cloudflare_clear(driver, 60)
+            time.sleep(2)
             links = get_category_article_links(driver)
             section_links[name] = links
             print(f"  {len(links)} links")
@@ -1285,10 +1339,14 @@ def main_incremental_selenium() -> int:
 
 
 def main_incremental() -> int:
-    """RSS on CI (Cloudflare); Selenium locally with RSS fallback."""
+    """CI: RSS (HTTP → browser) then Selenium+xvfb; local: Selenium then RSS."""
     if os.getenv("CI", "").lower() in ("1", "true"):
-        print("[INCREMENTAL] CI detected — using RSS feed")
-        return main_incremental_rss()
+        print("[INCREMENTAL] CI detected — RSS feed (HTTP / browser)")
+        n = main_incremental_rss()
+        if n < 0:
+            print("[INCREMENTAL] RSS blocked — falling back to Selenium category scrape")
+            return main_incremental_selenium()
+        return n
 
     count = main_incremental_selenium()
     if count == 0:
