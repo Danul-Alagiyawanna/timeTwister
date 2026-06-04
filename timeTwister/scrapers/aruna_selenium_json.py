@@ -14,15 +14,24 @@ from urllib.parse import urljoin, urlparse
 import os
 
 from incremental import (
+    get_section_checkpoint,
     incremental_fetch_limit,
     is_incremental_mode,
-    get_last_scraped_checkpoint,
-    is_last_scraped_article,
     load_known_links,
+    normalize_link,
     reached_incremental_limit,
     save_replace_only,
-    normalize_link,
+    update_section_checkpoints,
 )
+
+ARUNA_CATEGORIES = [
+    ("latest_news", "https://www.aruna.lk/categories/latest-news"),
+    ("sports", "https://www.aruna.lk/categories/sports"),
+    ("international", "https://www.aruna.lk/categories/international"),
+    ("business", "https://www.aruna.lk/categories/business"),
+    ("features", "https://www.aruna.lk/categories/features"),
+    ("editorial", "https://www.aruna.lk/categories/editorial"),
+]
 
 if sys.platform == 'win32':
     try:
@@ -305,109 +314,134 @@ def _create_driver():
     return driver
 
 
-def main_incremental():
-    """
-    Scrape newest articles only, stop when the last-scraped article URL is seen.
-    Intended for runs every ~10 minutes (scheduler / run_incremental_loop.py).
-    """
+def main_incremental() -> int:
+    """Per-section checkpoints — one boundary per category URL."""
     json_filename = _data_json_path()
-    checkpoint_link, checkpoint_title = get_last_scraped_checkpoint(json_filename)
-    bootstrap = not checkpoint_link
+    section_keys = [c[0] for c in ARUNA_CATEGORIES]
+    bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
     max_articles = incremental_fetch_limit(bootstrap=bootstrap)
-
-    print("[INCREMENTAL] Aruna scraper — stop when last scraped article is detected")
-    if bootstrap:
-        print(f"[INCREMENTAL] No prior data; bootstrap (max {max_articles} articles)")
-    else:
-        print(
-            f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
-            "(if checkpoint not found on feed)"
-        )
 
     known_previous = load_known_links(json_filename)
     if known_previous:
         print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
 
+    print("[INCREMENTAL] Aruna — per-section checkpoints")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+
     driver = _create_driver()
 
-    # Latest-news first (feed order matters for stop-on-seen)
-    CATEGORIES = [
-        ("LATEST_NEWS", "https://www.aruna.lk/categories/latest-news"),
-        ("SPORTS", "https://www.aruna.lk/categories/sports"),
-        ("INTERNATIONAL", "https://www.aruna.lk/categories/international"),
-        ("BUSINESS", "https://www.aruna.lk/categories/business"),
-        ("FEATURES", "https://www.aruna.lk/categories/features"),
-        ("EDITORIAL", "https://www.aruna.lk/categories/editorial"),
-    ]
-
-    new_articles = []
-    seen_this_run = set()
-    stop_all = False
-
-    for name, url in CATEGORIES:
-        if stop_all:
-            break
-        print(f"\n[INFO] Navigating to: {url} ({name})")
+    section_links: dict[str, list[str]] = {}
+    for name, url in ARUNA_CATEGORIES:
+        print(f"\n[PHASE 1] {name}: {url}")
         try:
             driver.get(url)
             time.sleep(3)
             links = get_main_article_links(driver, preserve_order=True)
-            print(f" Found {len(links)} links in category '{name}'")
+            section_links[name] = links
+            print(f"  {len(links)} links")
         except Exception as e:
-            print(f"  [ERROR] Error getting links for category {name}: {e}")
-            continue
+            print(f"  [ERROR] {e}")
+            section_links[name] = []
+
+    new_articles: list[dict] = []
+    seen_this_run: set[str] = set()
+    cap_hit = False
+
+    for name, _url in ARUNA_CATEGORIES:
+        if cap_hit:
+            break
+        links = section_links.get(name, [])
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
 
         for i, link in enumerate(links, 1):
             norm = normalize_link(link)
-            if is_last_scraped_article(link, checkpoint_link):
-                print(f"\n[INCREMENTAL] Reached last scraped article — stopping.")
-                print(f"             {link}")
-                stop_all = True
+            if sec_ckpt and normalize_link(sec_ckpt) == norm:
+                print("  [STOP] Reached section checkpoint")
                 break
             if norm in known_previous:
-                continue
+                print(f"  [STOP] Already in previous run: {link[:70]}")
+                break
             if norm in seen_this_run:
                 continue
 
-            print(f"\n Processing new article {i}: {link}")
+            print(f"\n  [INFO] New {i}: {link[:80]}...")
             try:
                 driver.get(link)
                 time.sleep(2)
                 metadata = extract_article_metadata(driver)
-                article_date = metadata['date_published']
+                article_date = metadata["date_published"]
                 standardized_date = (
                     article_date.strftime("%Y-%m-%d %H:%M:%S")
                     if article_date
                     else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
-                article = {
-                    'title': metadata['title'],
-                    'link': metadata['link'] or link,
-                    'description': metadata['description'],
-                    'date': standardized_date,
-                    'image_url': metadata['image_url'],
-                    'date_source': f"Meta tag: {standardized_date}" if article_date else "Incremental scrape",
-                }
-                new_articles.append(article)
+                title = (metadata.get("title") or "").strip()
+                description = (metadata.get("description") or "").strip()
+                if not title and not description:
+                    print(f"  [SKIP] Empty row: {link[:80]}")
+                    continue
+                new_articles.append(
+                    {
+                        "title": title,
+                        "link": metadata.get("link") or link,
+                        "summary": description,
+                        "description": description,
+                        "date": standardized_date,
+                        "image_url": metadata.get("image_url") or "",
+                        "date_source": (
+                            f"Meta tag: {standardized_date}"
+                            if article_date
+                            else "Incremental scrape"
+                        ),
+                        "section": name,
+                    }
+                )
                 seen_this_run.add(norm)
-
-                if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
-                    label = "Bootstrap" if bootstrap else "Run safety"
-                    print(f"\n[INCREMENTAL] {label} limit ({max_articles}) reached.")
-                    stop_all = True
-                    break
+                print(f"  [+] {title[:70]}")
             except Exception as e:
-                print(f"     Error processing article: {e}")
-                continue
+                print(f"  [ERROR] {e}")
 
-            time.sleep(1)
+            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+                label = "Bootstrap" if bootstrap else "Run safety"
+                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
+                cap_hit = True
+                break
 
-    driver.quit()
+            time.sleep(0.5)
 
-    print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
-    save_replace_only(json_filename, new_articles)
+        if links:
+            head_url = links[0]
+            head_title = ""
+            head_norm = normalize_link(head_url)
+            for a in new_articles:
+                if normalize_link(a.get("link", "")) == head_norm:
+                    head_title = a.get("title", "") or ""
+                    break
+            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
+            print(f"  [CKPT] {name} newest on page: {head_url[:70]}")
 
+    for name, links in section_links.items():
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        if not sec_ckpt and links:
+            update_section_checkpoints(json_filename, {name: (links[0], "")})
+            print(f"[SEED] {name}: {links[0][:80]}")
+
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+    print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
+    if new_articles:
+        save_replace_only(json_filename, new_articles)
+    else:
+        print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
     print("\n Aruna incremental scraper finished.")
+    return len(new_articles)
 
 
 def main(start_date=None, end_date=None):
@@ -426,18 +460,10 @@ def main(start_date=None, end_date=None):
 
     driver = _create_driver()
     
-    CATEGORIES = [
-        ("LATEST_NEWS", "https://www.aruna.lk/categories/latest-news"),
-        ("SPORTS", "https://www.aruna.lk/categories/sports"),
-        ("INTERNATIONAL", "https://www.aruna.lk/categories/international"),
-        ("BUSINESS", "https://www.aruna.lk/categories/business"),
-        ("FEATURES", "https://www.aruna.lk/categories/features"),
-        ("EDITORIAL", "https://www.aruna.lk/categories/editorial")
-    ]
     article_links = []
     seen_links = set()
     
-    for name, url in CATEGORIES:
+    for name, url in ARUNA_CATEGORIES:
         print(f"\n[INFO] Navigating to: {url}")
         try:
             driver.get(url)
