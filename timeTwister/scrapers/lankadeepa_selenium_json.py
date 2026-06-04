@@ -1042,10 +1042,7 @@ def main_incremental() -> int:
         pass
 
     print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
-    if new_articles:
-        save_replace_only(json_filename, new_articles)
-    else:
-        print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
+    save_replace_only(json_filename, new_articles)
     return len(new_articles)
 
 

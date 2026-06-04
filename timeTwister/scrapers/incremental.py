@@ -389,6 +389,46 @@ def merge_and_save(
     return added
 
 
+def sync_global_checkpoint_from_sections(articles_json_path: str) -> bool:
+    """Set global checkpoint to the newest section boundary (by URL date)."""
+    import re
+
+    state = load_checkpoint_state(articles_json_path)
+    sections = state.get("sections") or {}
+    if not sections:
+        return False
+
+    best_key: tuple[str, str, str] = ("", "", "")
+    best_link = ""
+    best_title = ""
+    for entry in sections.values():
+        if not isinstance(entry, dict):
+            continue
+        link = entry.get("last_scraped_link") or ""
+        match = re.search(r"/(\d{4})/(\d{2})/(\d{2})/", link)
+        if not match:
+            continue
+        key = match.groups()
+        if key > best_key:
+            best_key = key
+            best_link = link
+            best_title = entry.get("last_scraped_title") or ""
+
+    if not best_link:
+        return False
+
+    update_section_checkpoints(
+        articles_json_path,
+        {},
+        global_newest=(best_link, best_title),
+    )
+    print(
+        f"[INCREMENTAL] Global checkpoint synced from sections: "
+        f"{best_title[:50] or best_link[:70]}"
+    )
+    return True
+
+
 def save_replace_only(
     json_path: str,
     articles: list[dict[str, Any]],
@@ -396,13 +436,16 @@ def save_replace_only(
     """
     Overwrite the JSON with exactly these articles (use [] when none).
     Does not merge with previous file contents.
-    Updates checkpoint to articles[0] when non-empty; leaves checkpoint unchanged when empty.
+    Multi-section outlets sync global checkpoint from section boundaries.
     """
     os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(articles, f, ensure_ascii=False, indent=2)
 
-    if articles:
+    state = load_checkpoint_state(json_path)
+    multi_section = bool(state.get("sections"))
+
+    if articles and not multi_section:
         newest = articles[0]
         _save_checkpoint(
             json_path,
@@ -412,8 +455,17 @@ def save_replace_only(
         print(
             f"[INCREMENTAL] Replaced file with {len(articles)} article(s) → {json_path}"
         )
+    elif articles and multi_section:
+        print(
+            f"[INCREMENTAL] Replaced file with {len(articles)} article(s) → {json_path}"
+        )
+        sync_global_checkpoint_from_sections(json_path)
     else:
-        print(f"[INCREMENTAL] No new articles — saved empty list → {json_path}")
+        print(
+            f"[INCREMENTAL] No new articles — pipeline file cleared ([]) → {json_path}"
+        )
+        if multi_section:
+            sync_global_checkpoint_from_sections(json_path)
 
     return len(articles)
 

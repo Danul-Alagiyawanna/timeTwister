@@ -202,7 +202,7 @@ def _finalize_incremental_save(
         new_articles = before_save(new_articles)
     if save_mode == "merge":
         merge_and_save(json_path, new_articles)
-    elif new_articles:
+    elif save_mode == "replace":
         save_replace_only(json_path, new_articles)
     else:
         print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
