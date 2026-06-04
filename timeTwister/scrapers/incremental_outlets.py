@@ -421,7 +421,8 @@ def run_themorning_incremental() -> int:
 
     driver = create_standard_driver(use_undetected=False)
 
-    # Phase 1: collect links for every section; seed any missing checkpoints
+    # Phase 1: collect links only (no seeding yet — seeding before Phase 2 causes
+    # Phase 2 to stop immediately on the seeded article)
     section_links: dict[str, list[str]] = {}
     for cat, url in pages:
         print(f"\n[PHASE 1] {cat}: {url}")
@@ -429,17 +430,14 @@ def run_themorning_incremental() -> int:
             driver.get(url)
             time.sleep(3)
             links = mod.get_main_article_links(driver)
-            section_links[cat] = links
+            # preserve deterministic order — get_main_article_links uses a set internally
+            section_links[cat] = list(dict.fromkeys(links))
             print(f"  {len(links)} links")
-            existing_ckpt, _ = get_section_checkpoint(json_path, cat)
-            if not existing_ckpt and links:
-                update_section_checkpoints(json_path, {cat: (links[0], "")})
-                print(f"  [SEED] {links[0][:80]}")
         except Exception as e:
             print(f"  [ERROR] {e}")
             section_links[cat] = []
 
-    # Phase 2: fetch new articles per section up to cap
+    # Phase 2: fetch new articles per section up to global cap
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
     cap_hit = False
@@ -475,6 +473,14 @@ def run_themorning_incremental() -> int:
                 break
 
             time.sleep(0.5)
+
+    # Post-Phase 2: seed any sections still without a checkpoint so future runs
+    # don't re-scrape old content from sections the cap prevented us from reaching
+    for cat, links in section_links.items():
+        sec_ckpt, _ = get_section_checkpoint(json_path, cat)
+        if not sec_ckpt and links:
+            update_section_checkpoints(json_path, {cat: (links[0], "")})
+            print(f"[SEED] {cat}: {links[0][:80]}")
 
     driver.quit()
 
