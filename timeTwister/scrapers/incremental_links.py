@@ -1,4 +1,14 @@
-"""Link-only collectors for incremental scrapes (first list page per category URL)."""
+"""
+Link-only collectors for incremental list pages (one function per outlet/layout).
+
+These are intentionally outlet-specific: each site uses different DOM (XPath, CSS,
+pagination). incremental_outlets.py wires each scraper to its collector + fetch fn;
+stop/checkpoint logic lives in incremental.py / incremental_runner.py / per-outlet RSS.
+
+To add an outlet: implement collect_<outlet>_links(driver, category_url) here, then
+register pages in incremental_outlets.run_<outlet>_incremental() or the scraper's
+main_incremental().
+"""
 from __future__ import annotations
 
 import re

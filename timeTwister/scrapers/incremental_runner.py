@@ -18,12 +18,11 @@ from typing import Any, Callable
 from incremental import (
     INCREMENTAL_BOOTSTRAP_LIMIT,
     INCREMENTAL_RUN_LIMIT,
-    get_last_scraped_checkpoint,
-    is_last_scraped_article,
-    load_known_links,
+    load_incremental_boundary_links,
     merge_and_save,
     normalize_link,
     save_replace_only,
+    should_stop_at_feed_item,
 )
 
 CollectLinksFn = Callable[[Any, str], list[str]]
@@ -196,7 +195,7 @@ def run_incremental_scraper(
     Returns count of new articles saved this run.
     """
     json_path = data_json_path(data_filename)
-    checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
+    checkpoint_link, known_previous = load_incremental_boundary_links(json_path)
     bootstrap = not checkpoint_link
     if bootstrap:
         max_articles = (
@@ -206,10 +205,11 @@ def run_incremental_scraper(
         )
     else:
         max_articles = run_limit if run_limit is not None else INCREMENTAL_RUN_LIMIT
-    # URLs already saved in the JSON file (replace-only = last run's batch)
-    known_previous = load_known_links(json_path)
     if known_previous:
-        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
+        print(
+            f"[INCREMENTAL] Boundary set: {len(known_previous)} URL(s) "
+            "(archive + checkpoint)"
+        )
 
     print(f"[INCREMENTAL] {outlet_name} — stop when last scraped article is detected")
     if bootstrap:
@@ -244,15 +244,24 @@ def run_incremental_scraper(
             for i, link in enumerate(links, 1):
                 norm = normalize_link(link)
 
-                if is_last_scraped_article(link, checkpoint_link):
-                    print(f"\n[INCREMENTAL] Reached last scraped article — stopping.")
+                stop_reason = should_stop_at_feed_item(
+                    link,
+                    checkpoint_link=checkpoint_link,
+                    known_previous=known_previous,
+                )
+                if stop_reason == "checkpoint":
+                    print(
+                        f"\n[INCREMENTAL] Reached boundary ({stop_reason}) — stopping."
+                    )
                     print(f"             {link}")
                     stop_all = True
                     break
-
-                if norm in known_previous:
-                    print(f"[SKIP] Already in previous run: {link[:80]}...")
-                    continue
+                if stop_reason == "known_previous":
+                    print(
+                        f"\n[INCREMENTAL] Reached boundary ({stop_reason}) on this page."
+                    )
+                    print(f"             {link}")
+                    break
 
                 if norm in seen_this_run:
                     continue

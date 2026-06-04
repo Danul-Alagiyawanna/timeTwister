@@ -272,3 +272,34 @@ def load_known_links(json_path: str) -> set[str]:
         if isinstance(item, dict) and item.get("link"):
             known.add(normalize_link(item["link"]))
     return known
+
+
+def load_incremental_boundary_links(
+    json_path: str,
+) -> tuple[str | None, set[str]]:
+    """
+    Normalized checkpoint URL plus every URL already stored (including checkpoint).
+    Used on newest-first feeds so we stop instead of skipping with continue.
+    """
+    checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
+    known = load_known_links(json_path)
+    if checkpoint_link:
+        known.add(checkpoint_link)
+    return checkpoint_link, known
+
+
+def should_stop_at_feed_item(
+    link: str,
+    *,
+    checkpoint_link: str | None,
+    known_previous: set[str],
+) -> str | None:
+    """
+    Newest-first feed: return a stop reason when this item is already scraped.
+    """
+    norm = normalize_link(link)
+    if checkpoint_link and norm == checkpoint_link:
+        return "checkpoint"
+    if norm in known_previous:
+        return "known_previous"
+    return None

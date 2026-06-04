@@ -29,14 +29,13 @@ import re
 import os
 
 from incremental import (
-    get_last_scraped_checkpoint,
     incremental_fetch_limit,
     is_incremental_mode,
-    is_last_scraped_article,
-    load_known_links,
+    load_incremental_boundary_links,
+    merge_and_save,
     normalize_link,
     reached_incremental_limit,
-    save_replace_only,
+    should_stop_at_feed_item,
 )
 from incremental_runner import article_from_content, data_json_path, run_incremental_scraper
 from incremental_links import collect_divaina_breaking_links, collect_divaina_main_links
@@ -1480,13 +1479,15 @@ def _fetch_divaina_feed_articles() -> list[dict]:
 def main_incremental_rss() -> int:
     """Global checkpoint via site RSS (GHA — article pages block plain Selenium)."""
     json_filename = data_json_path("divaina_latest_news.json")
-    checkpoint_link, _ = get_last_scraped_checkpoint(json_filename)
+    checkpoint_link, known_previous = load_incremental_boundary_links(json_filename)
     bootstrap = not checkpoint_link
     max_articles = incremental_fetch_limit(bootstrap=bootstrap)
 
-    known_previous = load_known_links(json_filename)
     if known_previous:
-        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
+        print(
+            f"[INCREMENTAL] Boundary set: {len(known_previous)} URL(s) "
+            "(archive + checkpoint)"
+        )
 
     print("[INCREMENTAL] Divaina — RSS feed order (newest first)")
     if bootstrap:
@@ -1512,14 +1513,18 @@ def main_incremental_rss() -> int:
         link = art["link"]
         norm = normalize_link(link)
 
-        if is_last_scraped_article(link, checkpoint_link):
-            print(f"\n[INCREMENTAL] Reached last scraped article — stopping.")
+        stop_reason = should_stop_at_feed_item(
+            link,
+            checkpoint_link=checkpoint_link,
+            known_previous=known_previous,
+        )
+        if stop_reason:
+            print(
+                f"\n[INCREMENTAL] Reached boundary ({stop_reason}) — stopping."
+            )
             print(f"             {link}")
             break
 
-        if norm in known_previous:
-            print(f"[SKIP] Already in previous run: {link[:80]}...")
-            continue
         if norm in seen_this_run:
             continue
         if not art.get("title") and not art.get("summary") and not art.get("description"):
@@ -1539,7 +1544,7 @@ def main_incremental_rss() -> int:
 
     print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
     if new_articles:
-        save_replace_only(json_filename, new_articles)
+        merge_and_save(json_filename, new_articles)
     else:
         print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
     return len(new_articles)
