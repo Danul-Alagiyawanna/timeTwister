@@ -316,7 +316,15 @@ def collect_divaina_main_links(driver: Any, url: str) -> list[str]:
         href = a["href"]
         if not href.startswith("http"):
             href = urljoin("https://www.divaina.lk", href)
-        if "divaina.lk" in href and "/article/" in href and href not in seen:
+        if (
+            "divaina.lk" in href
+            and (
+                "/main-news/" in href
+                or "/provincial-news/" in href
+                or "/article/" in href
+            )
+            and href not in seen
+        ):
             seen.add(href)
             links.append(href)
     return links[:40]

@@ -26,6 +26,26 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import re
+import os
+
+from incremental import (
+    get_last_scraped_checkpoint,
+    incremental_fetch_limit,
+    is_incremental_mode,
+    is_last_scraped_article,
+    load_known_links,
+    normalize_link,
+    reached_incremental_limit,
+    save_replace_only,
+)
+from incremental_runner import article_from_content, data_json_path, run_incremental_scraper
+from incremental_links import collect_divaina_breaking_links, collect_divaina_main_links
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass
 
 BASE_URL = "https://www.divaina.lk/category/breaking-news"
 MAIN_NEWS_URL = "https://www.divaina.lk/category/main-news"
@@ -1162,18 +1182,435 @@ def main(start_date=None, end_date=None, page_type="all"):
         articles_with_images = sum(1 for article in all_articles if article['image_url'] and article['image_url'] != '')
         print(f"[IMAGE] Articles with images: {articles_with_images}/{len(all_articles)}")
 
-if __name__ == "__main__":
-    import os
+_DIVAINA_ARTICLE_RE = re.compile(
+    r"https?://(?:www\.)?divaina\.lk/(breaking-news|main-news|provincial-news|article)/\d+",
+    re.I,
+)
 
+
+def _chrome_major_version() -> int | None:
+    import subprocess
+
+    for cmd in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        try:
+            out = subprocess.check_output([cmd, "--version"], text=True, timeout=10)
+            m = re.search(r"(\d+)\.", out)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            continue
+    return None
+
+
+def _create_divaina_driver():
+    """UC with version_main retry — required on GHA (plain Selenium hits Cloudflare)."""
+    if USE_UNDETECTED:
+        print("[INFO] Using undetected-chromedriver...")
+        options = uc.ChromeOptions()
+        options.page_load_strategy = "eager"
+        options.add_experimental_option(
+            "prefs", {"profile.default_content_setting_values": {"popups": 1}}
+        )
+        if os.getenv("CI"):
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+
+        major = _chrome_major_version()
+        attempts: list[tuple[str, dict]] = [("auto", {})]
+        if major:
+            attempts.insert(0, (f"version_main={major}", {"version_main": major}))
+
+        last_err: Exception | None = None
+        for label, kwargs in attempts:
+            try:
+                print(f"[INFO] Starting undetected Chrome ({label})...")
+                driver = uc.Chrome(options=options, use_subprocess=True, **kwargs)
+                print("[INFO] Undetected Chrome started successfully")
+                driver.execute_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
+                return driver
+            except Exception as e:
+                last_err = e
+                print(f"[WARNING] UC failed ({label}): {str(e)[:200]}")
+
+        print(f"[WARNING] UC unavailable: {last_err}")
+
+    print("[INFO] Falling back to regular Selenium...")
+    chrome_options = Options()
+    chrome_options.page_load_strategy = "eager"
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+    chrome_options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.execute_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    return driver
+
+
+def _http_get(url: str, **kwargs):
+    """curl_cffi first (GHA Cloudflare), then requests."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        "Accept-Language": "en-US,en;q=0.9,si;q=0.8",
+        "Referer": "https://www.divaina.lk/",
+    }
+    import requests as req
+
+    for profile in ("chrome124", "chrome120", "safari17_0", "firefox133"):
+        try:
+            from curl_cffi import requests as cf_req  # type: ignore
+
+            r = cf_req.get(
+                url, impersonate=profile, timeout=25, headers=headers, **kwargs
+            )
+            if r.status_code == 200 and len(r.text) > 200:
+                print(f"[INFO] curl_cffi ({profile}) OK for {url}")
+                return r
+            print(f"[WARN] curl_cffi ({profile}) {r.status_code} for {url}")
+        except ImportError:
+            break
+        except Exception as e:
+            print(f"[WARN] curl_cffi ({profile}): {e}")
+
+    try:
+        r = req.get(url, timeout=20, allow_redirects=True, headers=headers, **kwargs)
+        if r.status_code == 200 and len(r.text) > 200:
+            return r
+        print(f"[WARN] requests {r.status_code} for {url}")
+    except Exception as e:
+        print(f"[WARN] requests failed: {e}")
+    return None
+
+
+def _is_divaina_article_url(link: str) -> bool:
+    return bool(link and _DIVAINA_ARTICLE_RE.search(link))
+
+
+def _html_to_plain(html: str) -> str:
+    if not html:
+        return ""
+    try:
+        text = BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
+    except Exception:
+        text = html.strip()
+    cut = re.split(
+        r"The post .+ appeared first on ",
+        text,
+        maxsplit=1,
+        flags=re.I,
+    )
+    return cut[0].strip()
+
+
+def _first_img_from_html(html: str) -> str:
+    if not html:
+        return ""
+    for pattern in (
+        r'<img[^>]+src=["\']([^"\']+)["\']',
+        r'<img[^>]+data-src=["\']([^"\']+)["\']',
+    ):
+        m = re.search(pattern, html, re.I)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _build_divaina_article_row(
+    *,
+    title: str,
+    link: str,
+    date_str: str,
+    body_text: str,
+    image_url: str = "",
+    date_source: str = "",
+) -> dict:
+    return {
+        "title": title,
+        "link": link,
+        "summary": body_text,
+        "description": body_text,
+        "date": date_str,
+        "image_url": image_url,
+        "date_source": date_source or f"RSS: {date_str}",
+    }
+
+
+def _parse_divaina_rss(xml_text: str) -> list[dict]:
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    ns = {
+        "content": "http://purl.org/rss/1.0/modules/content/",
+        "dc": "http://purl.org/dc/elements/1.1/",
+        "media": "http://search.yahoo.com/mrss/",
+    }
+    articles: list[dict] = []
+    root = ET.fromstring(xml_text)
+    items = root.findall("./channel/item") or root.findall(".//item")
+    for item in items:
+        link = (item.findtext("link") or "").strip()
+        if not _is_divaina_article_url(link):
+            continue
+        title = (item.findtext("title") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if pub_date:
+            try:
+                date_str = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+
+        desc_html = (item.findtext("description") or "").strip()
+        content_el = item.find("content:encoded", ns)
+        content_html = (content_el.text or "").strip() if content_el is not None else ""
+        body_text = _html_to_plain(content_html) or _html_to_plain(desc_html)
+
+        image_url = ""
+        thumb = item.find("media:thumbnail", ns)
+        if thumb is not None and thumb.get("url"):
+            image_url = thumb.get("url", "").strip()
+        enclosure = item.find("enclosure")
+        if not image_url and enclosure is not None and enclosure.get("type", "").startswith(
+            "image"
+        ):
+            image_url = (enclosure.get("url") or "").strip()
+        if not image_url:
+            image_url = _first_img_from_html(content_html) or _first_img_from_html(desc_html)
+
+        articles.append(
+            _build_divaina_article_row(
+                title=title,
+                link=link,
+                date_str=date_str,
+                body_text=body_text,
+                image_url=image_url,
+                date_source=f"RSS: {date_str}",
+            )
+        )
+    return articles
+
+
+def _wait_cloudflare_clear(driver, max_wait: int = 60) -> bool:
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        title = (driver.title or "").lower()
+        if "just a moment" not in title and "attention required" not in title:
+            return True
+        print("[INFO] Waiting for Cloudflare challenge...")
+        time.sleep(4)
+    return False
+
+
+def _extract_rss_xml_from_html(page_source: str) -> str:
+    m = re.search(r"<\?xml[^>]*\?>.*?</rss>", page_source, re.DOTALL | re.I)
+    if m:
+        return m.group(0)
+    idx = page_source.lower().find("<rss")
+    return page_source[idx:] if idx >= 0 else ""
+
+
+def _fetch_divaina_feed_via_selenium() -> list[dict]:
+    print("[INFO] Fetching Divaina RSS via browser (undetected Chrome)...")
+    driver = _create_divaina_driver()
+    driver.set_page_load_timeout(90)
+    try:
+        driver.get("https://www.divaina.lk/feed/")
+        if not _wait_cloudflare_clear(driver, 75):
+            print("[WARN] Cloudflare still blocking /feed/ in browser")
+            return []
+        xml = _extract_rss_xml_from_html(driver.page_source)
+        if not xml or "<item" not in xml:
+            print(f"[WARN] Browser feed page is not RSS (title={driver.title[:50]!r})")
+            return []
+        items = _parse_divaina_rss(xml)
+        valid = [a for a in items if _is_divaina_article_url(a.get("link", ""))]
+        print(f"[INFO] Browser RSS parsed {len(valid)} article URL(s)")
+        return valid
+    except Exception as e:
+        print(f"[ERROR] Browser feed fetch failed: {e}")
+        return []
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def _fetch_divaina_feed_articles() -> list[dict]:
+    for feed_url in ("https://www.divaina.lk/feed/", "https://divaina.lk/feed/"):
+        resp = _http_get(feed_url)
+        if not resp:
+            continue
+        if "just a moment" in resp.text.lower()[:8000]:
+            print(f"[WARN] Cloudflare interstitial on {feed_url}")
+            continue
+        print(f"[INFO] RSS fetched {feed_url} ({len(resp.text)} bytes)")
+        try:
+            items = _parse_divaina_rss(resp.text)
+            valid = [a for a in items if _is_divaina_article_url(a.get("link", ""))]
+            if valid:
+                print(f"[INFO] RSS parsed {len(valid)} article URL(s)")
+                return valid
+            print(f"[WARN] RSS had {len(items)} items but 0 article URLs")
+        except Exception as e:
+            print(f"[WARN] RSS parse error: {e}")
+
+    if os.getenv("CI", "").lower() in ("1", "true"):
+        valid = _fetch_divaina_feed_via_selenium()
+        if valid:
+            return valid
+
+    print("[WARN] Divaina /feed/ unavailable via HTTP and browser")
+    return []
+
+
+def main_incremental_rss() -> int:
+    """Global checkpoint via site RSS (GHA — article pages block plain Selenium)."""
+    json_filename = data_json_path("divaina_latest_news.json")
+    checkpoint_link, _ = get_last_scraped_checkpoint(json_filename)
+    bootstrap = not checkpoint_link
+    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+
+    known_previous = load_known_links(json_filename)
+    if known_previous:
+        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
+
+    print("[INCREMENTAL] Divaina — RSS feed order (newest first)")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(
+            f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
+            f"(checkpoint: {checkpoint_link[:70]}...)"
+        )
+
+    all_feed = _fetch_divaina_feed_articles()
+    if not all_feed:
+        print("[ERROR] No Divaina article URLs from RSS — keeping existing data")
+        return -1
+
+    new_articles: list[dict] = []
+    seen_this_run: set[str] = set()
+    cap_hit = False
+
+    for i, art in enumerate(all_feed, 1):
+        if cap_hit:
+            break
+        link = art["link"]
+        norm = normalize_link(link)
+
+        if is_last_scraped_article(link, checkpoint_link):
+            print(f"\n[INCREMENTAL] Reached last scraped article — stopping.")
+            print(f"             {link}")
+            break
+
+        if norm in known_previous:
+            print(f"[SKIP] Already in previous run: {link[:80]}...")
+            continue
+        if norm in seen_this_run:
+            continue
+        if not art.get("title") and not art.get("summary") and not art.get("description"):
+            print(f"[SKIP] Empty row: {link[:80]}...")
+            continue
+
+        print(f"\n[INFO] New {i}: {link[:80]}...")
+        new_articles.append(art)
+        seen_this_run.add(norm)
+        print(f"[+] {(art.get('title') or '')[:70]}")
+
+        if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+            label = "Bootstrap" if bootstrap else "Run safety"
+            print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
+            cap_hit = True
+            break
+
+    print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
+    if new_articles:
+        save_replace_only(json_filename, new_articles)
+    else:
+        print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
+    return len(new_articles)
+
+
+def _fetch_divaina_article(driver, link: str) -> dict | None:
+    driver.get(link)
+    _wait_cloudflare_clear(driver, 75)
+    time.sleep(2)
+    meta = extract_with_timeout(driver, timeout_seconds=30)
+    if not meta:
+        return None
+    return article_from_content(meta, link)
+
+
+def main_incremental_selenium() -> int:
+    pages = [
+        ("breaking", BASE_URL),
+        ("main", MAIN_NEWS_URL),
+        ("provincial", PROVINCIAL_NEWS_URL),
+    ]
+
+    def collect(d, url):
+        if "main-news" in url or "provincial" in url:
+            return collect_divaina_main_links(d, url)
+        return collect_divaina_breaking_links(d, url)
+
+    return run_incremental_scraper(
+        outlet_name="Divaina",
+        data_filename="divaina_latest_news.json",
+        pages=pages,
+        collect_links=collect,
+        fetch_article=_fetch_divaina_article,
+        create_driver=_create_divaina_driver,
+        use_undetected=False,
+    )
+
+
+def main_incremental() -> int:
+    """CI: RSS (HTTP → browser) then Selenium+xvfb; local: Selenium then RSS."""
+    if os.getenv("CI", "").lower() in ("1", "true"):
+        print("[INCREMENTAL] CI detected — Divaina RSS feed (HTTP / browser)")
+        n = main_incremental_rss()
+        if n < 0:
+            print("[INCREMENTAL] RSS blocked — falling back to Selenium category scrape")
+            return main_incremental_selenium()
+        return n
+
+    count = main_incremental_selenium()
+    if count == 0:
+        try:
+            driver = _create_divaina_driver()
+            driver.get(BASE_URL)
+            time.sleep(2)
+            cf = "just a moment" in (driver.title or "").lower()
+            driver.quit()
+        except Exception:
+            cf = True
+        if cf:
+            print("[INCREMENTAL] Cloudflare detected — falling back to RSS")
+            return main_incremental_rss()
+    return count
+
+
+if __name__ == "__main__":
     _scraper_dir = os.path.dirname(os.path.abspath(__file__))
     if _scraper_dir not in sys.path:
         sys.path.insert(0, _scraper_dir)
-    from incremental import is_incremental_mode
 
     if is_incremental_mode():
-        from incremental_outlets import run_incremental_for_module
-
-        run_incremental_for_module("divaina_selenium_json")
+        main_incremental()
         sys.exit(0)
 
     if len(sys.argv) >= 3:

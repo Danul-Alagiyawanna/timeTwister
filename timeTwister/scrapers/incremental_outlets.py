@@ -535,26 +535,7 @@ def run_dinamina_incremental() -> int:
 
 
 def run_divaina_incremental() -> int:
-    mod = _import_scraper("divaina_selenium_json")
-    pages = [
-        ("breaking", mod.BASE_URL),
-        ("main", mod.MAIN_NEWS_URL),
-        ("provincial", mod.PROVINCIAL_NEWS_URL),
-    ]
-
-    def collect(d, url):
-        if "main-news" in url or "provincial" in url:
-            return collect_divaina_main_links(d, url)
-        return collect_divaina_breaking_links(d, url)
-
-    return run_incremental_scraper(
-        outlet_name="Divaina",
-        data_filename="divaina_latest_news.json",
-        pages=pages,
-        collect_links=collect,
-        fetch_article=lambda d, l: _fetch_content(d, l, mod),
-        use_undetected=True,
-    )
+    return _import_scraper("divaina_selenium_json").main_incremental()
 
 
 def run_lankadeepa_incremental() -> int:

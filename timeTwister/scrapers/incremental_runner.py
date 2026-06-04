@@ -296,7 +296,9 @@ def run_incremental_scraper(
     print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
     if save_mode == "merge":
         merge_and_save(json_path, new_articles)
-    else:
+    elif new_articles:
         save_replace_only(json_path, new_articles)
+    else:
+        print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
     print(f"[INCREMENTAL] {outlet_name} finished.")
     return len(new_articles)

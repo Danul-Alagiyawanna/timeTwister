@@ -129,7 +129,7 @@ jobs:
           SCRAPE_MODE: incremental
           CI: "true"
         run: |
-          if [ "${{ matrix.id }}" = "dinamina" ]; then
+          if [ "${{ matrix.id }}" = "dinamina" ] || [ "${{ matrix.id }}" = "divaina" ]; then
             xvfb-run -a python scrapers/${{ matrix.module }}.py --incremental
           else
             python scrapers/${{ matrix.module }}.py --incremental
