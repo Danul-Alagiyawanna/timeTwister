@@ -14,15 +14,24 @@ from urllib.parse import urljoin, urlparse
 import os
 
 from incremental import (
+    get_section_checkpoint,
     incremental_fetch_limit,
     is_incremental_mode,
-    get_last_scraped_checkpoint,
-    is_last_scraped_article,
     load_known_links,
     reached_incremental_limit,
     save_replace_only,
     normalize_link,
+    update_section_checkpoints,
 )
+
+ISLAND_CATEGORIES = [
+    ("news", "https://island.lk/category/news/"),
+    ("business", "https://island.lk/category/business/"),
+    ("sports", "https://island.lk/category/sports/"),
+    ("politics", "https://island.lk/category/politics/"),
+    ("features", "https://island.lk/category/features/"),
+    ("opinion", "https://island.lk/category/opinion/"),
+]
 
 if sys.platform == 'win32':
     try:
@@ -288,92 +297,118 @@ def _create_driver():
 
 
 def main_incremental():
+    """Per-section checkpoints — each category page tracks its own newest article."""
     json_filename = _data_json_path()
-    checkpoint_link, _ = get_last_scraped_checkpoint(json_filename)
-    bootstrap = not checkpoint_link
+    section_keys = [c[0] for c in ISLAND_CATEGORIES]
+    bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
     max_articles = incremental_fetch_limit(bootstrap=bootstrap)
-
-    print("[INCREMENTAL] Island — stop when last scraped article is detected")
-    if bootstrap:
-        print(f"[INCREMENTAL] No prior data; bootstrap (max {max_articles} articles)")
-    else:
-        print(
-            f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
-            "(if checkpoint not found on feed)"
-        )
 
     known_previous = load_known_links(json_filename)
     if known_previous:
         print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
 
+    print("[INCREMENTAL] Island — per-section checkpoints")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+
     driver = _create_driver()
 
-    categories = [
-        ("NEWS", "https://island.lk/category/news/"),
-        ("BUSINESS", "https://island.lk/category/business/"),
-        ("SPORTS", "https://island.lk/category/sports/"),
-        ("POLITICS", "https://island.lk/category/politics/"),
-        ("FEATURES", "https://island.lk/category/features/"),
-        ("OPINION", "https://island.lk/category/opinion/"),
-    ]
-
-    new_articles = []
-    seen_this_run = set()
-    stop_all = False
-
-    for name, url in categories:
-        if stop_all:
-            break
-        print(f"\n[INFO] {name}: {url}")
+    # Phase 1: collect ordered links per category
+    section_links: dict[str, list[str]] = {}
+    for name, url in ISLAND_CATEGORIES:
+        print(f"\n[PHASE 1] {name}: {url}")
         try:
             driver.get(url)
             time.sleep(3)
             links = get_main_article_links(driver, preserve_order=True)
+            section_links[name] = links
+            print(f"  {len(links)} links")
         except Exception as e:
             print(f"  [ERROR] {e}")
-            continue
+            section_links[name] = []
+
+    # Phase 2: fetch new articles per section up to global cap
+    new_articles = []
+    seen_this_run: set[str] = set()
+    cap_hit = False
+
+    for name, _url in ISLAND_CATEGORIES:
+        if cap_hit:
+            break
+        links = section_links.get(name, [])
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
 
         for i, link in enumerate(links, 1):
-            if is_last_scraped_article(link, checkpoint_link):
-                print(f"\n[INCREMENTAL] Reached last scraped article — stopping.\n             {link}")
-                stop_all = True
-                break
             norm = normalize_link(link)
+            if sec_ckpt and normalize_link(sec_ckpt) == norm:
+                print(f"  [STOP] Reached section checkpoint")
+                break
             if norm in known_previous:
-                continue
+                print(f"  [STOP] Already in previous run: {link[:70]}")
+                break
             if norm in seen_this_run:
                 continue
 
-            print(f"\n Processing new article {i}: {link}")
+            print(f"\n  [INFO] New {i}: {link[:80]}...")
             try:
                 driver.get(link)
                 time.sleep(2)
                 metadata = extract_article_metadata(driver)
-                article_date = metadata['date_published']
+                article_date = metadata["date_published"]
                 standardized_date = (
                     article_date.strftime("%Y-%m-%d %H:%M:%S")
                     if article_date
                     else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
+                title = metadata["title"] or ""
+                if not title and not metadata.get("description"):
+                    print(f"  [SKIP] Empty row: {link[:80]}")
+                    continue
                 new_articles.append({
-                    'title': metadata['title'],
-                    'link': metadata['link'] or link,
-                    'description': metadata['description'],
-                    'date': standardized_date,
-                    'image_url': metadata['image_url'],
-                    'date_source': f"Meta tag: {standardized_date}" if article_date else "Incremental scrape",
+                    "title": title,
+                    "link": metadata["link"] or link,
+                    "description": metadata["description"],
+                    "date": standardized_date,
+                    "image_url": metadata["image_url"],
+                    "date_source": (
+                        f"Meta tag: {standardized_date}"
+                        if article_date
+                        else "Incremental scrape"
+                    ),
                 })
                 seen_this_run.add(norm)
-                if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
-                    print(
-                        f"\n[INCREMENTAL] "
-                        f"{'Bootstrap' if bootstrap else 'Run safety'} limit ({max_articles}) reached."
-                    )
-                    stop_all = True
-                    break
+                print(f"  [+] {title[:70]}")
             except Exception as e:
-                print(f"     Error: {e}")
-            time.sleep(1)
+                print(f"  [ERROR] {e}")
+
+            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+                label = "Bootstrap" if bootstrap else "Run safety"
+                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
+                cap_hit = True
+                break
+
+            time.sleep(0.5)
+
+        # Checkpoint = newest article on this category page (links[0])
+        if links:
+            head_title = ""
+            head_norm = normalize_link(links[0])
+            for a in new_articles:
+                if normalize_link(a.get("link", "")) == head_norm:
+                    head_title = a.get("title", "") or ""
+                    break
+            update_section_checkpoints(json_filename, {name: (links[0], head_title)})
+            print(f"  [CKPT] {name} newest on page: {links[0][:70]}")
+
+    # Sections skipped due to cap — seed from Phase 1 head link
+    for name, links in section_links.items():
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        if not sec_ckpt and links:
+            update_section_checkpoints(json_filename, {name: (links[0], "")})
+            print(f"[SEED] {name}: {links[0][:80]}")
 
     driver.quit()
     print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
@@ -436,14 +471,7 @@ def main(start_date=None, end_date=None):
     # Add stealth settings
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     
-    CATEGORIES = [
-    ("NEWS", "https://island.lk/category/news/"),
-    ("BUSINESS", "https://island.lk/category/business/"),
-    ("SPORTS", "https://island.lk/category/sports/"),
-    ("POLITICS", "https://island.lk/category/politics/"),
-    ("FEATURES", "https://island.lk/category/features/"),
-    ("OPINION", "https://island.lk/category/opinion/")
-]
+    CATEGORIES = [(n.upper(), u) for n, u in ISLAND_CATEGORIES]
     article_links = []
     seen_links = set()
     
@@ -460,7 +488,7 @@ def main(start_date=None, end_date=None):
                     seen_links.add(link)
                     article_links.append(link)
         except Exception as e:
-            print(f"  [ERROR] Error getting links for category {cat}: {e}")
+            print(f"  [ERROR] Error getting links for category {name}: {e}")
             
     print(f"\n[INFO] Found total of {len(article_links)} unique article links across all categories")
     
