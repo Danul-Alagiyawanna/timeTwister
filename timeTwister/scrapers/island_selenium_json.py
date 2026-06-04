@@ -175,21 +175,57 @@ def is_article_in_date_range(article_date, start_date, end_date):
 
 
 
+def _canonical_island_url(url: str) -> str:
+    """https + normalized path so checkpoint matches across http/https variants."""
+    norm = normalize_link(url)
+    if not norm:
+        return url.strip()
+    if norm.startswith("http://"):
+        return "https://" + norm[7:]
+    return norm
+
+
+def _is_island_article_href(href: str) -> bool:
+    if not href or href.startswith("#"):
+        return False
+    full = urljoin("https://island.lk/", href)
+    if "island.lk" not in full:
+        return False
+    skip = ("category", "author", "about", "contact", "archives", "classifieds", "/page/", "/tag/")
+    if any(s in full for s in skip):
+        return False
+    path = urlparse(full).path
+    return path.count("/") >= 2 and len(path) > 10
+
+
 def get_main_article_links(driver, preserve_order=False):
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    ordered = []
-    seen = set()
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if href.startswith('http://island.lk/') or href.startswith('https://island.lk/'):
-            if 'category' not in href and 'author' not in href and 'about' not in href and 'contact' not in href and 'archives' not in href:
-                if href.count('/') >= 3 and len(href) > 30:
-                    if preserve_order:
-                        if href not in seen:
-                            seen.add(href)
-                            ordered.append(href)
-                    else:
-                        seen.add(href)
+    """
+    Collect article URLs from the category listing only.
+    Ignores nav mega-menus and the site-wide 'Latest News' hero (feat left column).
+    """
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add_href(href: str) -> None:
+        if not _is_island_article_href(href):
+            return
+        canon = _canonical_island_url(href)
+        if canon in seen:
+            return
+        seen.add(canon)
+        ordered.append(canon)
+
+    # Category page hero: right column = this category; left = global Latest News (skip left)
+    feat_right = soup.select_one("#mvp-cat-feat-wrap .mvp-widget-feat2-right")
+    if feat_right:
+        for a in feat_right.find_all("a", href=True):
+            add_href(a["href"])
+
+    # Main infinite list for this category
+    for a in soup.select("ul.mvp-blog-story-list a[href]"):
+        add_href(a["href"])
+
     if preserve_order:
         return ordered
     return list(seen)
@@ -392,23 +428,25 @@ def main_incremental():
 
             time.sleep(0.5)
 
-        # Checkpoint = newest article on this category page (links[0])
+        # Checkpoint = newest article in this category's listing (not site-wide nav hero)
         if links:
+            head_url = links[0]
             head_title = ""
-            head_norm = normalize_link(links[0])
+            head_norm = normalize_link(head_url)
             for a in new_articles:
                 if normalize_link(a.get("link", "")) == head_norm:
                     head_title = a.get("title", "") or ""
                     break
-            update_section_checkpoints(json_filename, {name: (links[0], head_title)})
-            print(f"  [CKPT] {name} newest on page: {links[0][:70]}")
+            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
+            print(f"  [CKPT] {name} newest on page: {head_url[:70]}")
 
     # Sections skipped due to cap — seed from Phase 1 head link
     for name, links in section_links.items():
         sec_ckpt, _ = get_section_checkpoint(json_filename, name)
         if not sec_ckpt and links:
-            update_section_checkpoints(json_filename, {name: (links[0], "")})
-            print(f"[SEED] {name}: {links[0][:80]}")
+            seed_url = _canonical_island_url(links[0])
+            update_section_checkpoints(json_filename, {name: (seed_url, "")})
+            print(f"[SEED] {name}: {seed_url[:80]}")
 
     driver.quit()
     print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
