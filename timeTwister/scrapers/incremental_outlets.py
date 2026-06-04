@@ -23,7 +23,6 @@ from incremental_links import (
     collect_dailynews_links,
     collect_divaina_breaking_links,
     collect_divaina_main_links,
-    collect_lankadeepa_links,
     collect_thamilan_links,
     collect_virakesari_links,
     collect_wp_category_links,
@@ -539,23 +538,7 @@ def run_divaina_incremental() -> int:
 
 
 def run_lankadeepa_incremental() -> int:
-    mod = _import_scraper("lankadeepa_selenium_json")
-    pages = [
-        ("latest", "https://www.lankadeepa.lk/latest-news/1"),
-        ("features", "https://www.lankadeepa.lk/features/2"),
-        ("politics", "https://www.lankadeepa.lk/politics/13"),
-        ("sports", "https://www.lankadeepa.lk/sports/7"),
-        ("world", "https://www.lankadeepa.lk/world/8"),
-    ]
-
-    return run_incremental_scraper(
-        outlet_name="Lankadeepa",
-        data_filename="lankadeepa_latest_news.json",
-        pages=pages,
-        collect_links=collect_lankadeepa_links,
-        fetch_article=lambda d, l: _fetch_content(d, l, mod),
-        use_undetected=True,
-    )
+    return _import_scraper("lankadeepa_selenium_json").main_incremental()
 
 
 def run_mawbima_incremental() -> int:

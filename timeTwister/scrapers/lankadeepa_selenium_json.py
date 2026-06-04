@@ -26,9 +26,33 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import re
+import os
 import threading
 from functools import wraps
 import locale
+
+from incremental import (
+    get_section_checkpoint,
+    incremental_fetch_limit,
+    is_incremental_mode,
+    load_known_links,
+    normalize_link,
+    reached_incremental_limit,
+    save_replace_only,
+    update_section_checkpoints,
+)
+from incremental_links import collect_lankadeepa_links
+from incremental_runner import article_from_content, create_standard_driver, data_json_path
+
+LANKADEEPA_CATEGORIES = [
+    ("latest", "https://www.lankadeepa.lk/latest-news/1"),
+    ("features", "https://www.lankadeepa.lk/features/2"),
+    ("politics", "https://www.lankadeepa.lk/politics/13"),
+    ("sports", "https://www.lankadeepa.lk/sports/7"),
+    ("provincial", "https://www.lankadeepa.lk/provincial/9"),
+    ("world", "https://www.lankadeepa.lk/world/8"),
+    ("editorial", "https://www.lankadeepa.lk/editorial/15"),
+]
 
 # Set up UTF-8 encoding for console output (Windows fix)
 import sys
@@ -921,18 +945,124 @@ def main(start_date=None, end_date=None, page_type="all"):
         articles_with_images = sum(1 for article in all_articles if article['image_url'] and article['image_url'] != '')
         print(f"[IMAGE] Articles with images: {articles_with_images}/{len(all_articles)}")
 
-if __name__ == "__main__":
-    import os
 
+def main_incremental() -> int:
+    """Per-section checkpoints — each category URL tracks its own newest article."""
+    json_filename = data_json_path("lankadeepa_latest_news.json")
+    section_keys = [c[0] for c in LANKADEEPA_CATEGORIES]
+    bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
+    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+
+    known_previous = load_known_links(json_filename)
+    if known_previous:
+        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
+
+    print("[INCREMENTAL] Lankadeepa — per-section checkpoints")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+
+    driver = create_standard_driver(use_undetected=True)
+    driver.set_page_load_timeout(60)
+
+    section_links: dict[str, list[str]] = {}
+    for name, url in LANKADEEPA_CATEGORIES:
+        print(f"\n[PHASE 1] {name}: {url}")
+        try:
+            links = collect_lankadeepa_links(driver, url)
+            section_links[name] = links
+            print(f"  {len(links)} links")
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            section_links[name] = []
+
+    new_articles: list[dict] = []
+    seen_this_run: set[str] = set()
+    cap_hit = False
+
+    for name, _url in LANKADEEPA_CATEGORIES:
+        if cap_hit:
+            break
+        links = section_links.get(name, [])
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
+
+        for i, link in enumerate(links, 1):
+            norm = normalize_link(link)
+            if sec_ckpt and normalize_link(sec_ckpt) == norm:
+                print("  [STOP] Reached section checkpoint")
+                break
+            if norm in known_previous:
+                print(f"  [STOP] Already in previous run: {link[:70]}")
+                break
+            if norm in seen_this_run:
+                continue
+
+            print(f"\n  [INFO] New {i}: {link[:80]}...")
+            try:
+                driver.get(link)
+                time.sleep(2)
+                meta = extract_with_timeout(driver, timeout_seconds=30)
+                row = article_from_content(meta, link) if meta else None
+                if not row or (
+                    not row.get("title")
+                    and not row.get("description")
+                    and not row.get("summary")
+                ):
+                    print(f"  [SKIP] Empty row: {link[:80]}")
+                    continue
+                new_articles.append(row)
+                seen_this_run.add(norm)
+                print(f"  [+] {(row.get('title') or '')[:70]}")
+            except Exception as e:
+                print(f"  [ERROR] {e}")
+
+            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+                label = "Bootstrap" if bootstrap else "Run safety"
+                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
+                cap_hit = True
+                break
+
+            time.sleep(0.5)
+
+        if links:
+            head_url = links[0]
+            head_title = ""
+            head_norm = normalize_link(head_url)
+            for a in new_articles:
+                if normalize_link(a.get("link", "")) == head_norm:
+                    head_title = a.get("title", "") or ""
+                    break
+            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
+            print(f"  [CKPT] {name} newest on page: {head_url[:70]}")
+
+    for name, links in section_links.items():
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        if not sec_ckpt and links:
+            update_section_checkpoints(json_filename, {name: (links[0], "")})
+            print(f"[SEED] {name}: {links[0][:80]}")
+
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+    print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
+    if new_articles:
+        save_replace_only(json_filename, new_articles)
+    else:
+        print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
+    return len(new_articles)
+
+
+if __name__ == "__main__":
     _scraper_dir = os.path.dirname(os.path.abspath(__file__))
     if _scraper_dir not in sys.path:
         sys.path.insert(0, _scraper_dir)
-    from incremental import is_incremental_mode
 
     if is_incremental_mode():
-        from incremental_outlets import run_incremental_for_module
-
-        run_incremental_for_module("lankadeepa_selenium_json")
+        main_incremental()
         sys.exit(0)
 
     # Check if date range is provided as command line arguments
