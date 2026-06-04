@@ -394,7 +394,6 @@ def run_themorning_incremental() -> int:
         INCREMENTAL_BOOTSTRAP_LIMIT,
         INCREMENTAL_RUN_LIMIT,
         get_section_checkpoint,
-        load_checkpoint_state,
         load_known_links,
         normalize_link,
         save_replace_only,
@@ -407,8 +406,8 @@ def run_themorning_incremental() -> int:
     pages = [(c, f"https://www.themorning.lk/categories/{c}") for c in cats]
     json_path = data_json_path("themorning_latest_news.json")
 
-    checkpoint_state = load_checkpoint_state(json_path)
-    bootstrap = not any(get_section_checkpoint(checkpoint_state, c) for c in cats)
+    # bootstrap = no section has a checkpoint yet
+    bootstrap = not any(get_section_checkpoint(json_path, c)[0] for c in cats)
     max_articles = INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
     known_previous = load_known_links(json_path)
     if known_previous:
@@ -432,8 +431,9 @@ def run_themorning_incremental() -> int:
             links = mod.get_main_article_links(driver)
             section_links[cat] = links
             print(f"  {len(links)} links")
-            if not get_section_checkpoint(checkpoint_state, cat) and links:
-                update_section_checkpoints(checkpoint_state, cat, links[0])
+            existing_ckpt, _ = get_section_checkpoint(json_path, cat)
+            if not existing_ckpt and links:
+                update_section_checkpoints(json_path, {cat: (links[0], "")})
                 print(f"  [SEED] {links[0][:80]}")
         except Exception as e:
             print(f"  [ERROR] {e}")
@@ -448,7 +448,7 @@ def run_themorning_incremental() -> int:
         if cap_hit:
             break
         links = section_links.get(cat, [])
-        sec_ckpt = get_section_checkpoint(checkpoint_state, cat)
+        sec_ckpt, _ = get_section_checkpoint(json_path, cat)
         print(f"\n[PHASE 2] {cat} — checkpoint: {(sec_ckpt or 'None')[:70]}")
 
         for link in links:
@@ -463,7 +463,7 @@ def run_themorning_incremental() -> int:
                 if meta and (meta.get("title") or meta.get("summary")):
                     new_articles.append(meta)
                     seen_this_run.add(norm)
-                    update_section_checkpoints(checkpoint_state, cat, link)
+                    update_section_checkpoints(json_path, {cat: (link, meta.get("title", ""))})
                     print(f"  [+] {meta.get('title', '')[:70]}")
             except Exception as e:
                 print(f"  [ERROR] {e}")
