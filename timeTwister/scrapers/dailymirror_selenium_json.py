@@ -832,6 +832,38 @@ def _normalize_article_link(url: str) -> str:
     return normalize_link(url)
 
 
+def _article_id_from_dailymirror_link(link: str) -> int:
+    """Numeric story id from …/108-341946 style URLs."""
+    m = re.search(r"-(\d+)/?$", (link or "").rstrip("/"))
+    return int(m.group(1)) if m else 0
+
+
+def _order_links_newest_first(links: list[str]) -> list[str]:
+    """Ensure newest-first for incremental stop/checkpoint (detect DOM order)."""
+    if len(links) < 2:
+        return links
+    first_id = _article_id_from_dailymirror_link(links[0])
+    last_id = _article_id_from_dailymirror_link(links[-1])
+    if first_id and last_id and first_id < last_id:
+        ordered = list(reversed(links))
+        print(
+            f"[INFO] List DOM oldest-first (ids {first_id}→{last_id}); "
+            "reversed to newest-first"
+        )
+        return ordered
+    print(f"[INFO] List DOM newest-first (ids {first_id}→{last_id})")
+    return links
+
+
+def sort_dailymirror_articles_newest_first(articles: list[dict]) -> list[dict]:
+    """Checkpoint uses articles[0]; must be highest story id / newest."""
+    return sorted(
+        articles,
+        key=lambda a: _article_id_from_dailymirror_link(a.get("link", "")),
+        reverse=True,
+    )
+
+
 def collect_list_page_links(driver, list_url: str) -> list[str]:
     """Ordered article URLs from one list page (same XPath as date-range main)."""
     global _LIST_PAGE_HINTS
@@ -873,8 +905,7 @@ def collect_list_page_links(driver, list_url: str) -> list[str]:
             }
         except Exception:
             break
-    # DOM order is oldest-first; incremental expects newest-first (stop at checkpoint early)
-    links.reverse()
+    links = _order_links_newest_first(links)
     print(f"[INFO] collect_list_page_links: {len(links)} URLs (newest-first) from {list_url}")
     return links
 
@@ -949,9 +980,19 @@ def create_driver(headless=None):
 def _parse_list_date_text(date_text: str) -> datetime | None:
     if not date_text:
         return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
+    text = re.sub(r"\s+", " ", date_text.strip())
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%d %b %Y %H:%M",
+        "%d %B %Y %H:%M",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+    ):
         try:
-            return datetime.strptime(date_text.strip(), fmt)
+            return datetime.strptime(text, fmt)
         except ValueError:
             continue
     return None
@@ -1044,7 +1085,7 @@ def main_incremental():
     # One list page only — stop at checkpoint; page 2 caused re-scraping past the boundary
     pages = [("latest", BASE_URL)]
 
-    run_incremental_scraper(
+    return run_incremental_scraper(
         outlet_name="Daily Mirror",
         data_filename="dailymirror_latest_news.json",
         pages=pages,
@@ -1055,6 +1096,7 @@ def main_incremental():
         save_mode="replace",
         sleep_between_articles=1.0,
         sleep_after_list_page=2.0,
+        before_save=sort_dailymirror_articles_newest_first,
     )
 
 

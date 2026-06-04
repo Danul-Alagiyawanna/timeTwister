@@ -55,27 +55,10 @@ def collect_dailynews_links(driver: Any, url: str) -> list[str]:
 
 
 def collect_dailymirror_links(driver: Any, url: str) -> list[str]:
-    _navigate(driver, url, 5)
-    try:
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "/html/body/div[7]/div/div/div/div[1]/div[2]")
-            )
-        )
-    except Exception:
-        return []
-    links: list[str] = []
-    for i in range(1, 31):
-        heading_xpath = f"/html/body/div[7]/div/div/div/div[1]/div[2]/div[{i}]/div/div[1]/a[2]/h3"
-        try:
-            heading = driver.find_element(By.XPATH, heading_xpath)
-            parent = heading.find_element(By.XPATH, "..")
-            href = parent.get_attribute("href")
-            if href:
-                links.append(href)
-        except Exception:
-            break
-    return links
+    """Delegate to scraper (newest-first ordering + list hints)."""
+    from dailymirror_selenium_json import collect_list_page_links
+
+    return collect_list_page_links(driver, url)
 
 
 def _economynext_fetch_with_cffi(url: str) -> "BeautifulSoup | None":

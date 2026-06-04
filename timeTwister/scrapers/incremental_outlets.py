@@ -19,7 +19,6 @@ if _SCRAPERS_DIR not in sys.path:
 
 from incremental_links import (
     collect_ceylontoday_links,
-    collect_dailymirror_links,
     collect_dailynews_links,
     collect_divaina_breaking_links,
     collect_divaina_main_links,
@@ -128,20 +127,7 @@ def run_ceylontoday_incremental() -> int:
 
 
 def run_dailymirror_incremental() -> int:
-    mod = _import_scraper("dailymirror_selenium_json")
-    pages = [("latest", mod.BASE_URL)]
-
-    def fetch(d, link):
-        return _fetch_content(d, link, mod)
-
-    return run_incremental_scraper(
-        outlet_name="Daily Mirror",
-        data_filename="dailymirror_latest_news.json",
-        pages=pages,
-        collect_links=collect_dailymirror_links,
-        fetch_article=fetch,
-        use_undetected=True,
-    )
+    return _import_scraper("dailymirror_selenium_json").main_incremental()
 
 
 def run_economynext_incremental() -> int:

@@ -189,6 +189,7 @@ def run_incremental_scraper(
     sleep_after_list_page: float = 2.0,
     use_undetected: bool = True,
     save_mode: str = "replace",
+    before_save: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
 ) -> int:
     """
     Scrape list pages top-to-bottom; stop at last checkpoint URL.
@@ -303,6 +304,8 @@ def run_incremental_scraper(
     ]
 
     print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
+    if before_save and new_articles:
+        new_articles = before_save(new_articles)
     if save_mode == "merge":
         merge_and_save(json_path, new_articles)
     elif new_articles:
