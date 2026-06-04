@@ -447,6 +447,7 @@ def run_themorning_incremental() -> int:
         links = section_links.get(cat, [])
         sec_ckpt, _ = get_section_checkpoint(json_path, cat)
         print(f"\n[PHASE 2] {cat} — checkpoint: {(sec_ckpt or 'None')[:70]}")
+        first_in_section = True
 
         for link in links:
             norm = normalize_link(link)
@@ -460,7 +461,9 @@ def run_themorning_incremental() -> int:
                 if meta and (meta.get("title") or meta.get("summary")):
                     new_articles.append(meta)
                     seen_this_run.add(norm)
-                    update_section_checkpoints(json_path, {cat: (link, meta.get("title", ""))})
+                    if first_in_section:
+                        update_section_checkpoints(json_path, {cat: (link, meta.get("title", ""))})
+                        first_in_section = False
                     print(f"  [+] {meta.get('title', '')[:70]}")
             except Exception as e:
                 print(f"  [ERROR] {e}")
