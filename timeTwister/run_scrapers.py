@@ -1,8 +1,8 @@
 """
-Script to run all 17 scrapers in sequence.
+Script to run all 15 scrapers in sequence.
 Order: 1. sundaytimes 2. dailynews 3. ceylontoday 4. dailymirror 5. ftlk 6. economynext 7. morning
-       8. island 9. sundayobserver 10. dinamina 11. divaina 12. lankadeepa 13. aruna 
-       14. mawbima 15. virakesari 16. thinakaran 17. thamilan
+       8. sundayobserver 9. divaina 10. lankadeepa 11. aruna
+       12. mawbima 13. virakesari 14. thinakaran 15. thamilan
 """
 import sys
 import os
@@ -93,9 +93,7 @@ def main():
         ("ftlk", "ftlk_selenium_json", {"scrape_mode": "all"}),
         ("economynext", "economynext_selenium_json", {}),
         ("morning", "themorning_selenium_json", {}),
-        ("island", "island_selenium_json", {}),
         ("sundayobserver", "sundayobserver_selenium_json", {}),
-        ("dinamina", "dinamina_selenium_json", {}),
         ("divaina", "divaina_selenium_json", {}),
         ("lankadeepa", "lankadeepa_selenium_json", {}),
         ("aruna", "aruna_selenium_json", {}),

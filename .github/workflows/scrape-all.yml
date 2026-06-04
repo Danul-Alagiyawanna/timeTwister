@@ -4,7 +4,7 @@
 
 name: Scrape all news outlets
 
-# Avoid stacking 17+17 runners if a run is still in progress
+# Avoid stacking 15+15 runners if a run is still in progress
 concurrency:
   group: scrape-all
   cancel-in-progress: true
@@ -26,9 +26,7 @@ on:
           - ftlk
           - economynext
           - morning
-          - island
           - sundayobserver
-          - dinamina
           - divaina
           - lankadeepa
           - aruna
@@ -64,9 +62,7 @@ jobs:
               { id: 'ftlk', module: 'ftlk_selenium_json', data_file: 'ftlk_latest_news.json', incremental: true },
               { id: 'economynext', module: 'economynext_selenium_json', data_file: 'economynext_latest_news.json', incremental: true },
               { id: 'morning', module: 'themorning_selenium_json', data_file: 'themorning_latest_news.json', incremental: true },
-              { id: 'island', module: 'island_selenium_json', data_file: 'island_latest_news.json', incremental: true },
               { id: 'sundayobserver', module: 'sundayobserver_selenium_json', data_file: 'sundayobserver_latest_news.json', incremental: true },
-              { id: 'dinamina', module: 'dinamina_selenium_json', data_file: 'dinamina_latest_news.json', incremental: true },
               { id: 'divaina', module: 'divaina_selenium_json', data_file: 'divaina_latest_news.json', incremental: true },
               { id: 'lankadeepa', module: 'lankadeepa_selenium_json', data_file: 'lankadeepa_latest_news.json', incremental: true },
               { id: 'aruna', module: 'aruna_selenium_json', data_file: 'aruna_latest_news.json', incremental: true },
@@ -93,7 +89,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 17
+      max-parallel: 15
       matrix:
         include: ${{ fromJSON(needs.prepare-matrix.outputs.include) }}
 
@@ -130,7 +126,7 @@ jobs:
           SCRAPE_MODE: incremental
           CI: "true"
         run: |
-          if [ "${{ matrix.id }}" = "dinamina" ] || [ "${{ matrix.id }}" = "divaina" ]; then
+          if [ "${{ matrix.id }}" = "divaina" ]; then
             xvfb-run -a python scrapers/${{ matrix.module }}.py --incremental
           else
             python scrapers/${{ matrix.module }}.py --incremental
