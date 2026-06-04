@@ -14,6 +14,7 @@ import sys
 from datetime import datetime, timedelta
 
 from incremental import (
+    apply_section_head_checkpoints,
     incremental_fetch_limit,
     get_section_checkpoint,
     is_incremental_mode,
@@ -21,6 +22,7 @@ from incremental import (
     is_last_scraped_article,
     load_checkpoint_state,
     load_known_links,
+    migrate_global_checkpoint_to_sections,
     reached_section_incremental_limit,
     save_replace_only,
     update_section_checkpoints,
@@ -722,9 +724,10 @@ def main_incremental():
     json_filename = _data_json_path()
     _migrate_ftlk_section_checkpoints(json_filename)
 
+    ftlk_section_keys = [_ftlk_section_key(c, i) for c, i in FTLK_LIST_CATEGORIES]
+    migrate_global_checkpoint_to_sections(json_filename, ftlk_section_keys)
     has_any_section_cp = any(
-        get_section_checkpoint(json_filename, _ftlk_section_key(c, i))[0]
-        for c, i in FTLK_LIST_CATEGORIES
+        get_section_checkpoint(json_filename, k)[0] for k in ftlk_section_keys
     )
     global_checkpoint_link, _ = get_last_scraped_checkpoint(json_filename)
     bootstrap = not has_any_section_cp and not global_checkpoint_link
@@ -855,27 +858,22 @@ def main_incremental():
                     break
 
                 time.sleep(0.5)
-
-            if section_newest:
-                # Update section checkpoint to the freshest article we actually fetched
-                section_updates[section_key] = section_newest
     finally:
         driver.quit()
 
+    section_links_for_ckpt = {
+        key: [e["link"] for e in section_entries.get(key, []) if e.get("link")]
+        for key in ftlk_section_keys
+    }
+    apply_section_head_checkpoints(
+        json_filename,
+        section_links_for_ckpt,
+        new_articles,
+        section_keys=ftlk_section_keys,
+    )
+
     print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
     save_replace_only(json_filename, new_articles)
-
-    global_newest = None
-    if new_articles:
-        top = new_articles[0]
-        global_newest = (top.get("link", ""), top.get("title", ""))
-    if section_updates:
-        update_section_checkpoints(
-            json_filename,
-            section_updates,
-            global_newest=global_newest,
-        )
-        print(f"[INCREMENTAL] Updated {len(section_updates)} section checkpoint(s)")
 
     print("\n[INFO] FT.lk incremental scraper finished.")
 

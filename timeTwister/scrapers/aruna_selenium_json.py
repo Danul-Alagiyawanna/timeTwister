@@ -21,7 +21,8 @@ from incremental import (
     normalize_link,
     reached_section_incremental_limit,
     save_replace_only,
-    update_section_checkpoints,
+    apply_section_head_checkpoints,
+    migrate_global_checkpoint_to_sections,
 )
 
 ARUNA_CATEGORIES = [
@@ -318,6 +319,7 @@ def main_incremental() -> int:
     """Per-section checkpoints — one boundary per category URL."""
     json_filename = _data_json_path()
     section_keys = [c[0] for c in ARUNA_CATEGORIES]
+    migrate_global_checkpoint_to_sections(json_filename, section_keys)
     bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
     max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
@@ -414,22 +416,12 @@ def main_incremental() -> int:
 
             time.sleep(0.5)
 
-        if links:
-            head_url = links[0]
-            head_title = ""
-            head_norm = normalize_link(head_url)
-            for a in new_articles:
-                if normalize_link(a.get("link", "")) == head_norm:
-                    head_title = a.get("title", "") or ""
-                    break
-            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
-            print(f"  [CKPT] {name} newest on page: {head_url[:70]}")
-
-    for name, links in section_links.items():
-        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
-        if not sec_ckpt and links:
-            update_section_checkpoints(json_filename, {name: (links[0], "")})
-            print(f"[SEED] {name}: {links[0][:80]}")
+    apply_section_head_checkpoints(
+        json_filename,
+        section_links,
+        new_articles,
+        section_keys=section_keys,
+    )
 
     try:
         driver.quit()

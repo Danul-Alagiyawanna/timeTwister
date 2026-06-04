@@ -26,7 +26,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urldefrag, urlparse
 
 # Safety caps when checkpoint never appears on the feed
@@ -118,6 +118,73 @@ def get_section_checkpoint(
         title = entry.get("last_scraped_title") or ""
         return link, title
     return None, None
+
+
+def migrate_global_checkpoint_to_sections(
+    articles_json_path: str,
+    section_keys: list[str],
+) -> bool:
+    """Fill any section missing a checkpoint from the legacy global checkpoint."""
+    if not section_keys:
+        return False
+    state = load_checkpoint_state(articles_json_path)
+    global_link = state.get("last_scraped_link")
+    if not global_link:
+        return False
+    sections = state.get("sections") or {}
+    global_title = state.get("last_scraped_title") or ""
+    updates: dict[str, tuple[str, str]] = {}
+    for key in section_keys:
+        entry = sections.get(key)
+        if isinstance(entry, dict) and entry.get("last_scraped_link"):
+            continue
+        updates[key] = (global_link, global_title)
+    if not updates:
+        return False
+    update_section_checkpoints(articles_json_path, updates)
+    print(
+        f"[INCREMENTAL] Filled {len(updates)} missing section checkpoint(s) from global"
+    )
+    return True
+
+
+def apply_section_head_checkpoints(
+    articles_json_path: str,
+    section_links: dict[str, list[str]],
+    scraped_articles: list[dict[str, Any]] | None = None,
+    *,
+    section_keys: list[str] | None = None,
+    link_transform: Callable[[str], str] | None = None,
+) -> int:
+    """
+    Set each section checkpoint to links[0] (newest on that category list page).
+    Call after Phase 2 so every category that returned links is tracked.
+    """
+    keys = section_keys or list(section_links.keys())
+    articles = scraped_articles or []
+    updates: dict[str, tuple[str, str]] = {}
+    for name in keys:
+        links = section_links.get(name) or []
+        if not links:
+            continue
+        head_url = link_transform(links[0]) if link_transform else links[0]
+        head_title = ""
+        head_norm = normalize_link(head_url)
+        for article in articles:
+            if normalize_link(article.get("link", "")) == head_norm:
+                head_title = article.get("title", "") or ""
+                break
+        updates[name] = (head_url, head_title)
+
+    if updates:
+        update_section_checkpoints(articles_json_path, updates)
+        for name, (url, _) in updates.items():
+            print(f"  [CKPT] {name}: {url[:70]}")
+
+    missing = [k for k in keys if k not in updates]
+    if missing:
+        print(f"  [CKPT] No list links for: {', '.join(missing)}")
+    return len(updates)
 
 
 def update_section_checkpoints(
