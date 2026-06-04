@@ -7,7 +7,8 @@ Stop logic:
      is the stop boundary for the next run.
   2. Scrapers walk the live feed top-to-bottom; call is_last_scraped_article() each step.
   3. When it returns True, halt — we've caught up.
-  4. Safety cap if checkpoint never appears: 5 articles (bootstrap), 15 (normal run).
+  4. Safety cap if checkpoint never appears: 5/15 per section (multi-category)
+     or per run (single-feed); see incremental_fetch_limit(per_section=...).
   5. After saving, merge_and_save() / save_replace_only() updates the checkpoint.
 
 Usage:
@@ -28,17 +29,36 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urldefrag, urlparse
 
-# Safety caps: stop even if checkpoint URL never appears on the feed
-INCREMENTAL_BOOTSTRAP_LIMIT = 5  # first run (no checkpoint)
-INCREMENTAL_RUN_LIMIT = 15  # normal runs (checkpoint exists but missing from lists)
+# Safety caps when checkpoint never appears on the feed
+INCREMENTAL_BOOTSTRAP_LIMIT = 5
+INCREMENTAL_RUN_LIMIT = 15
+# Per-section/category (Aruna, Island, Lankadeepa, Dinamina, FT.lk, …)
+INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION = 5
+INCREMENTAL_RUN_LIMIT_PER_SECTION = 15
 
 
-def incremental_fetch_limit(*, bootstrap: bool) -> int:
+def incremental_fetch_limit(*, bootstrap: bool, per_section: bool = False) -> int:
+    """per_section=True: limit applies independently to each category/page."""
+    if per_section:
+        return (
+            INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION
+            if bootstrap
+            else INCREMENTAL_RUN_LIMIT_PER_SECTION
+        )
     return INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
 
 
 def reached_incremental_limit(article_count: int, *, bootstrap: bool) -> bool:
     return article_count >= incremental_fetch_limit(bootstrap=bootstrap)
+
+
+def reached_section_incremental_limit(
+    section_article_count: int, *, bootstrap: bool
+) -> bool:
+    """Safety cap for one category/section in a multi-feed scraper."""
+    return section_article_count >= incremental_fetch_limit(
+        bootstrap=bootstrap, per_section=True
+    )
 
 
 def is_incremental_mode(argv: list[str] | None = None) -> bool:

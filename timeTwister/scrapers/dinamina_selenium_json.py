@@ -34,7 +34,7 @@ from incremental import (
     is_incremental_mode,
     load_known_links,
     normalize_link,
-    reached_incremental_limit,
+    reached_section_incremental_limit,
     save_replace_only,
     update_section_checkpoints,
 )
@@ -1128,7 +1128,7 @@ def main_incremental_rss() -> int:
     json_filename = data_json_path("dinamina_latest_news.json")
     section_keys = [c[0] for c in DINAMINA_CATEGORIES]
     bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
-    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+    max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
     known_previous = load_known_links(json_filename)
     if known_previous:
@@ -1136,9 +1136,9 @@ def main_incremental_rss() -> int:
 
     print("[INCREMENTAL] Dinamina — RSS per-section (no Selenium)")
     if bootstrap:
-        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_per_section} per section")
     else:
-        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+        print(f"[INCREMENTAL] Run safety cap: {max_per_section} new articles per section")
 
     all_feed = _fetch_dinamina_feed_articles()
     if not all_feed:
@@ -1158,12 +1158,10 @@ def main_incremental_rss() -> int:
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
     section_stopped: set[str] = set()
-    cap_hit = False
+    section_new_counts: dict[str, int] = {k: 0 for k in section_keys}
 
     print("\n[PHASE 2] RSS feed order (newest first, per-section stop)")
     for i, art in enumerate(all_feed, 1):
-        if cap_hit:
-            break
         link = art["link"]
         norm = normalize_link(link)
         sec = _link_to_section(link)
@@ -1190,13 +1188,18 @@ def main_incremental_rss() -> int:
         print(f"  [INFO] New: {link[:80]}...")
         new_articles.append(art)
         seen_this_run.add(norm)
+        section_new_counts[sec] = section_new_counts.get(sec, 0) + 1
         print(f"  [+] {(art.get('title') or '')[:70]}")
 
-        if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+        if reached_section_incremental_limit(
+            section_new_counts[sec], bootstrap=bootstrap
+        ):
             label_lim = "Bootstrap" if bootstrap else "Run safety"
-            print(f"[INCREMENTAL] {label_lim} limit ({max_articles}) reached.")
-            cap_hit = True
-            break
+            print(
+                f"[INCREMENTAL] {label_lim} limit ({max_per_section}) "
+                f"for section {sec}"
+            )
+            section_stopped.add(sec)
 
     for name in section_keys:
         links = section_links.get(name, [])
@@ -1233,7 +1236,7 @@ def main_incremental_selenium() -> int:
     json_filename = data_json_path("dinamina_latest_news.json")
     section_keys = [c[0] for c in DINAMINA_CATEGORIES]
     bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
-    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+    max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
     known_previous = load_known_links(json_filename)
     if known_previous:
@@ -1241,9 +1244,9 @@ def main_incremental_selenium() -> int:
 
     print("[INCREMENTAL] Dinamina — per-section checkpoints")
     if bootstrap:
-        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_per_section} per section")
     else:
-        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+        print(f"[INCREMENTAL] Run safety cap: {max_per_section} new articles per section")
 
     driver = _create_dinamina_driver()
     driver.set_page_load_timeout(60)
@@ -1264,11 +1267,9 @@ def main_incremental_selenium() -> int:
 
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
-    cap_hit = False
 
     for name, _url in DINAMINA_CATEGORIES:
-        if cap_hit:
-            break
+        section_new = 0
         links = section_links.get(name, [])
         sec_ckpt, _ = get_section_checkpoint(json_filename, name)
         print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
@@ -1299,14 +1300,17 @@ def main_incremental_selenium() -> int:
                     continue
                 new_articles.append(row)
                 seen_this_run.add(norm)
+                section_new += 1
                 print(f"  [+] {(row.get('title') or '')[:70]}")
             except Exception as e:
                 print(f"  [ERROR] {e}")
 
-            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+            if reached_section_incremental_limit(section_new, bootstrap=bootstrap):
                 label = "Bootstrap" if bootstrap else "Run safety"
-                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
-                cap_hit = True
+                print(
+                    f"[INCREMENTAL] {label} limit ({max_per_section}) "
+                    f"for section {name} — next section"
+                )
                 break
 
             time.sleep(0.5)

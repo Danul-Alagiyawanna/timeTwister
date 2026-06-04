@@ -19,7 +19,7 @@ from incremental import (
     is_incremental_mode,
     load_known_links,
     normalize_link,
-    reached_incremental_limit,
+    reached_section_incremental_limit,
     save_replace_only,
     update_section_checkpoints,
 )
@@ -319,7 +319,7 @@ def main_incremental() -> int:
     json_filename = _data_json_path()
     section_keys = [c[0] for c in ARUNA_CATEGORIES]
     bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
-    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+    max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
     known_previous = load_known_links(json_filename)
     if known_previous:
@@ -327,9 +327,9 @@ def main_incremental() -> int:
 
     print("[INCREMENTAL] Aruna — per-section checkpoints")
     if bootstrap:
-        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_per_section} per section")
     else:
-        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+        print(f"[INCREMENTAL] Run safety cap: {max_per_section} new articles per section")
 
     driver = _create_driver()
 
@@ -348,11 +348,9 @@ def main_incremental() -> int:
 
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
-    cap_hit = False
 
     for name, _url in ARUNA_CATEGORIES:
-        if cap_hit:
-            break
+        section_new = 0
         links = section_links.get(name, [])
         sec_ckpt, _ = get_section_checkpoint(json_filename, name)
         print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
@@ -401,14 +399,17 @@ def main_incremental() -> int:
                     }
                 )
                 seen_this_run.add(norm)
+                section_new += 1
                 print(f"  [+] {title[:70]}")
             except Exception as e:
                 print(f"  [ERROR] {e}")
 
-            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+            if reached_section_incremental_limit(section_new, bootstrap=bootstrap):
                 label = "Bootstrap" if bootstrap else "Run safety"
-                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
-                cap_hit = True
+                print(
+                    f"[INCREMENTAL] {label} limit ({max_per_section}) "
+                    f"for section {name} — next section"
+                )
                 break
 
             time.sleep(0.5)

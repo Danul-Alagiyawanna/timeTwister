@@ -19,7 +19,7 @@ from incremental import (
     get_last_scraped_checkpoint,
     is_last_scraped_article,
     load_known_links,
-    reached_incremental_limit,
+    reached_section_incremental_limit,
     save_replace_only,
     normalize_link,
 )
@@ -332,14 +332,14 @@ def main_incremental():
     json_filename = _data_json_path()
     checkpoint_link, checkpoint_title = get_last_scraped_checkpoint(json_filename)
     bootstrap = not checkpoint_link
-    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+    max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
     print("[INCREMENTAL] Sunday Times — stop when last scraped article is detected")
     if bootstrap:
-        print(f"[INCREMENTAL] No prior data; bootstrap (max {max_articles} articles)")
+        print(f"[INCREMENTAL] No prior data; bootstrap (max {max_per_section} per category)")
     else:
         print(
-            f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
+            f"[INCREMENTAL] Run safety cap: {max_per_section} new articles per category "
             "(if checkpoint not found on feed)"
         )
 
@@ -370,6 +370,7 @@ def main_incremental():
             for cat in categories:
                 if stop_all:
                     break
+                section_new = 0
                 page_url = f"{base_url}/{date_str}/{cat}/"
                 entries = get_list_entries_from_page(driver, page_url)
                 if not entries:
@@ -409,11 +410,16 @@ def main_incremental():
                         'date_source': f"Meta tag: {standardized_date}" if article_date else "Incremental scrape",
                     })
                     seen_this_run.add(norm)
+                    section_new += 1
 
-                    if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+                    if reached_section_incremental_limit(
+                        section_new, bootstrap=bootstrap
+                    ):
                         label = "Bootstrap" if bootstrap else "Run safety"
-                        print(f"\n[INCREMENTAL] {label} limit ({max_articles}) reached.")
-                        stop_all = True
+                        print(
+                            f"\n[INCREMENTAL] {label} limit ({max_per_section}) "
+                            f"for {cat} — next category"
+                        )
                         break
 
                     time.sleep(0.5)

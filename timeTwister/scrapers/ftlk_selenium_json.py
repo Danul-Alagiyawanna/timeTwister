@@ -21,7 +21,7 @@ from incremental import (
     is_last_scraped_article,
     load_checkpoint_state,
     load_known_links,
-    reached_incremental_limit,
+    reached_section_incremental_limit,
     save_replace_only,
     update_section_checkpoints,
     normalize_link,
@@ -728,14 +728,14 @@ def main_incremental():
     )
     global_checkpoint_link, _ = get_last_scraped_checkpoint(json_filename)
     bootstrap = not has_any_section_cp and not global_checkpoint_link
-    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+    max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
     print("[INCREMENTAL] FT.lk — per-section checkpoints (stop each feed independently)")
     if bootstrap:
-        print(f"[INCREMENTAL] No prior data; bootstrap (max {max_articles} articles)")
+        print(f"[INCREMENTAL] No prior data; bootstrap (max {max_per_section} per section)")
     else:
         print(
-            f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
+            f"[INCREMENTAL] Run safety cap: {max_per_section} new articles per section "
             "(if a section checkpoint is missing from its feed)"
         )
 
@@ -795,6 +795,7 @@ def main_incremental():
             print(f"{'=' * 60}")
 
             section_newest: tuple[str, str] | None = None
+            section_new = 0
 
             for i, entry in enumerate(entries, 1):
                 link = entry['link']
@@ -840,13 +841,17 @@ def main_incremental():
                     'date_source': f"Article page: {standardized_date}",
                 })
                 seen_this_run.add(norm)
+                section_new += 1
 
                 if section_newest is None:
                     section_newest = (link, title)
 
-                if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+                if reached_section_incremental_limit(section_new, bootstrap=bootstrap):
                     label = "Bootstrap" if bootstrap else "Run safety"
-                    print(f"\n[INCREMENTAL] {label} limit ({max_articles}) reached.")
+                    print(
+                        f"\n[INCREMENTAL] {label} limit ({max_per_section}) "
+                        f"for section {section_key} — next section"
+                    )
                     break
 
                 time.sleep(0.5)
@@ -854,9 +859,6 @@ def main_incremental():
             if section_newest:
                 # Update section checkpoint to the freshest article we actually fetched
                 section_updates[section_key] = section_newest
-
-            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
-                break
     finally:
         driver.quit()
 

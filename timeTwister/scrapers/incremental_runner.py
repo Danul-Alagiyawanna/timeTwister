@@ -17,7 +17,9 @@ from typing import Any, Callable
 
 from incremental import (
     INCREMENTAL_BOOTSTRAP_LIMIT,
+    INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
     INCREMENTAL_RUN_LIMIT,
+    INCREMENTAL_RUN_LIMIT_PER_SECTION,
     load_incremental_boundary_links,
     merge_and_save,
     normalize_link,
@@ -185,6 +187,7 @@ def run_incremental_scraper(
     create_driver: CreateDriverFn | None = None,
     bootstrap_limit: int | None = None,
     run_limit: int | None = None,
+    per_section_limit: bool | None = None,
     sleep_between_articles: float = 0.5,
     sleep_after_list_page: float = 2.0,
     use_undetected: bool = True,
@@ -198,14 +201,24 @@ def run_incremental_scraper(
     json_path = data_json_path(data_filename)
     checkpoint_link, known_previous = load_incremental_boundary_links(json_path)
     bootstrap = not checkpoint_link
+    per_section = per_section_limit if per_section_limit is not None else len(pages) > 1
     if bootstrap:
         max_articles = (
             bootstrap_limit
             if bootstrap_limit is not None
-            else INCREMENTAL_BOOTSTRAP_LIMIT
+            else (
+                INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION
+                if per_section
+                else INCREMENTAL_BOOTSTRAP_LIMIT
+            )
         )
     else:
-        max_articles = run_limit if run_limit is not None else INCREMENTAL_RUN_LIMIT
+        if run_limit is not None:
+            max_articles = run_limit
+        elif per_section:
+            max_articles = INCREMENTAL_RUN_LIMIT_PER_SECTION
+        else:
+            max_articles = INCREMENTAL_RUN_LIMIT
     if known_previous:
         print(
             f"[INCREMENTAL] Boundary set: {len(known_previous)} URL(s) "
@@ -213,11 +226,15 @@ def run_incremental_scraper(
         )
 
     print(f"[INCREMENTAL] {outlet_name} — stop when last scraped article is detected")
+    cap_label = "per page/section" if per_section else "total"
     if bootstrap:
-        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+        print(
+            f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} "
+            f"articles {cap_label}"
+        )
     else:
         print(
-            f"[INCREMENTAL] Run safety cap: {max_articles} new articles "
+            f"[INCREMENTAL] Run safety cap: {max_articles} new articles {cap_label} "
             "(if checkpoint not found on feed)"
         )
 
@@ -232,6 +249,7 @@ def run_incremental_scraper(
         for name, page_url in pages:
             if stop_all:
                 break
+            page_new = 0
             print(f"\n{'=' * 50}\n[INCREMENTAL] {outlet_name} / {name}\n{page_url}")
 
             try:
@@ -280,13 +298,19 @@ def run_incremental_scraper(
                             continue
                         new_articles.append(row)
                         seen_this_run.add(norm)
+                        page_new += 1
                 except Exception as e:
                     print(f"[ERROR] Article failed: {e}")
 
-                if len(new_articles) >= max_articles:
+                if page_new >= max_articles:
                     label = "Bootstrap" if bootstrap else "Run safety"
-                    print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
-                    stop_all = True
+                    print(
+                        f"[INCREMENTAL] {label} limit ({max_articles}) "
+                        f"for {name}"
+                        + (" — next page" if per_section else " — stopping.")
+                    )
+                    if not per_section:
+                        stop_all = True
                     break
 
                 time.sleep(sleep_between_articles)

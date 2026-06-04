@@ -376,11 +376,11 @@ def run_economynext_incremental() -> int:
 def run_themorning_incremental() -> int:
     """Per-section checkpoints — each category tracks its own last-scraped URL."""
     from incremental import (
-        INCREMENTAL_BOOTSTRAP_LIMIT,
-        INCREMENTAL_RUN_LIMIT,
         get_section_checkpoint,
+        incremental_fetch_limit,
         load_known_links,
         normalize_link,
+        reached_section_incremental_limit,
         save_replace_only,
         update_section_checkpoints,
     )
@@ -393,16 +393,16 @@ def run_themorning_incremental() -> int:
 
     # bootstrap = no section has a checkpoint yet
     bootstrap = not any(get_section_checkpoint(json_path, c)[0] for c in cats)
-    max_articles = INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
+    max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
     known_previous = load_known_links(json_path)
     if known_previous:
         print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
 
     print("[INCREMENTAL] The Morning — per-section checkpoints")
     if bootstrap:
-        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_per_section} per section")
     else:
-        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+        print(f"[INCREMENTAL] Run safety cap: {max_per_section} new articles per section")
 
     driver = create_standard_driver(use_undetected=False)
 
@@ -421,14 +421,12 @@ def run_themorning_incremental() -> int:
             print(f"  [ERROR] {e}")
             section_links[cat] = []
 
-    # Phase 2: fetch new articles per section up to global cap
+    # Phase 2: fetch new articles per section (cap per category)
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
-    cap_hit = False
 
     for cat, _url in pages:
-        if cap_hit:
-            break
+        section_new = 0
         links = section_links.get(cat, [])
         sec_ckpt, _ = get_section_checkpoint(json_path, cat)
         print(f"\n[PHASE 2] {cat} — checkpoint: {(sec_ckpt or 'None')[:70]}")
@@ -450,14 +448,17 @@ def run_themorning_incremental() -> int:
                 if meta and (meta.get("title") or meta.get("summary")):
                     new_articles.append(meta)
                     seen_this_run.add(norm)
+                    section_new += 1
                     print(f"  [+] {meta.get('title', '')[:70]}")
             except Exception as e:
                 print(f"  [ERROR] {e}")
 
-            if len(new_articles) >= max_articles:
+            if reached_section_incremental_limit(section_new, bootstrap=bootstrap):
                 label = "Bootstrap" if bootstrap else "Run safety"
-                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
-                cap_hit = True
+                print(
+                    f"[INCREMENTAL] {label} limit ({max_per_section}) "
+                    f"for section {cat} — next section"
+                )
                 break
 
             time.sleep(0.5)
@@ -474,7 +475,7 @@ def run_themorning_incremental() -> int:
             update_section_checkpoints(json_path, {cat: (links[0], head_title)})
             print(f"  [CKPT] {cat} newest on page: {links[0][:70]}")
 
-    # Sections never reached (global cap) — seed from Phase 1 head link
+    # Sections with no checkpoint yet — seed from Phase 1 head link
     for cat, links in section_links.items():
         sec_ckpt, _ = get_section_checkpoint(json_path, cat)
         if not sec_ckpt and links:
