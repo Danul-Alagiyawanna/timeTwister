@@ -26,6 +26,29 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import re
+import os
+
+from incremental import (
+    get_section_checkpoint,
+    incremental_fetch_limit,
+    is_incremental_mode,
+    load_known_links,
+    normalize_link,
+    reached_incremental_limit,
+    save_replace_only,
+    update_section_checkpoints,
+)
+from incremental_runner import article_from_content, create_standard_driver, data_json_path
+
+DINAMINA_CATEGORIES = [
+    ("local", "https://www.dinamina.lk/category/local/"),
+    ("politics", "https://www.dinamina.lk/category/politics/"),
+    ("editorial", "https://www.dinamina.lk/category/editorial/"),
+    ("sports", "https://www.dinamina.lk/category/sports/"),
+    ("features", "https://www.dinamina.lk/category/features/"),
+    ("business", "https://www.dinamina.lk/category/business/"),
+    ("world", "https://www.dinamina.lk/category/world/"),
+]
 
 # Reconfigure stdout/stderr to use UTF-8 to prevent UnicodeEncodeError on Windows
 try:
@@ -35,6 +58,23 @@ except AttributeError:
     pass
 
 BASE_URL = "https://www.dinamina.lk/category/local/"
+
+
+def get_category_article_links(driver) -> list[str]:
+    """Ordered article URLs from a Dinamina category listing page."""
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    base = "https://www.dinamina.lk"
+    links: list[str] = []
+    seen: set[str] = set()
+    for a in soup.select("ul li article h2 a, section article h2 a, ul section article h2 a"):
+        href = a.get("href") or ""
+        if href.startswith("/"):
+            href = base + href
+        if href.startswith("http") and "dinamina" in href and href not in seen:
+            seen.add(href)
+            links.append(href)
+    return links
+
 
 class TimeoutError(Exception):
     """Custom timeout exception for extraction"""
@@ -604,6 +644,112 @@ def process_articles_from_page(driver, list_url, start_date, end_date):
     print(f"\n   Page summary: {articles_in_range} in range, {articles_outside_range} outside range")
     return articles_found, articles_in_range, articles_outside_range
 
+
+def main_incremental() -> int:
+    """Per-section checkpoints — each category tracks its newest article."""
+    json_filename = data_json_path("dinamina_latest_news.json")
+    section_keys = [c[0] for c in DINAMINA_CATEGORIES]
+    bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
+    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+
+    known_previous = load_known_links(json_filename)
+    if known_previous:
+        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
+
+    print("[INCREMENTAL] Dinamina — per-section checkpoints")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+
+    driver = create_standard_driver(use_undetected=USE_UNDETECTED)
+    driver.set_page_load_timeout(60)
+
+    section_links: dict[str, list[str]] = {}
+    for name, url in DINAMINA_CATEGORIES:
+        print(f"\n[PHASE 1] {name}: {url}")
+        try:
+            driver.get(url.rstrip("/") + "/")
+            time.sleep(3)
+            links = get_category_article_links(driver)
+            section_links[name] = links
+            print(f"  {len(links)} links")
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            section_links[name] = []
+
+    new_articles: list[dict] = []
+    seen_this_run: set[str] = set()
+    cap_hit = False
+
+    for name, _url in DINAMINA_CATEGORIES:
+        if cap_hit:
+            break
+        links = section_links.get(name, [])
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
+
+        for i, link in enumerate(links, 1):
+            norm = normalize_link(link)
+            if sec_ckpt and normalize_link(sec_ckpt) == norm:
+                print("  [STOP] Reached section checkpoint")
+                break
+            if norm in known_previous:
+                print(f"  [STOP] Already in previous run: {link[:70]}")
+                break
+            if norm in seen_this_run:
+                continue
+
+            print(f"\n  [INFO] New {i}: {link[:80]}...")
+            try:
+                driver.get(link)
+                time.sleep(2)
+                meta = extract_with_timeout(driver, timeout_seconds=30)
+                row = article_from_content(meta, link) if meta else None
+                if not row or (not row.get("title") and not row.get("description")):
+                    print(f"  [SKIP] Empty row: {link[:80]}")
+                    continue
+                new_articles.append(row)
+                seen_this_run.add(norm)
+                print(f"  [+] {(row.get('title') or '')[:70]}")
+            except Exception as e:
+                print(f"  [ERROR] {e}")
+
+            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+                label = "Bootstrap" if bootstrap else "Run safety"
+                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
+                cap_hit = True
+                break
+
+            time.sleep(0.5)
+
+        if links:
+            head_url = links[0]
+            head_title = ""
+            head_norm = normalize_link(head_url)
+            for a in new_articles:
+                if normalize_link(a.get("link", "")) == head_norm:
+                    head_title = a.get("title", "") or ""
+                    break
+            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
+            print(f"  [CKPT] {name} newest on page: {head_url[:70]}")
+
+    for name, links in section_links.items():
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        if not sec_ckpt and links:
+            update_section_checkpoints(json_filename, {name: (links[0], "")})
+            print(f"[SEED] {name}: {links[0][:80]}")
+
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+    print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
+    save_replace_only(json_filename, new_articles)
+    return len(new_articles)
+
+
 def main(start_date=None, end_date=None):
     """Main function."""
     
@@ -700,14 +846,12 @@ def main(start_date=None, end_date=None):
     driver.set_page_load_timeout(60)
     print(f"[INFO] Page load timeout set to 60 seconds")
 
-    categories = ["local", "politics", "editorial", "sports", "features", "business", "world"]
     scraped_urls = set()
     all_articles = []
     total_articles_in_range = 0
     total_articles_outside_range = 0
-    
-    for category in categories:
-        cat_url = f"https://www.dinamina.lk/category/{category}/"
+
+    for category, cat_url in DINAMINA_CATEGORIES:
         print(f"\n[INFO] === Processing category: {category} ({cat_url}) ===")
         
         try:
@@ -775,17 +919,12 @@ def main(start_date=None, end_date=None):
         print(f"[IMAGE] Articles with images: {articles_with_images}/{len(all_articles)}")
 
 if __name__ == "__main__":
-    import os
-
     _scraper_dir = os.path.dirname(os.path.abspath(__file__))
     if _scraper_dir not in sys.path:
         sys.path.insert(0, _scraper_dir)
-    from incremental import is_incremental_mode
 
     if is_incremental_mode():
-        from incremental_outlets import run_incremental_for_module
-
-        run_incremental_for_module("dinamina_selenium_json")
+        main_incremental()
         sys.exit(0)
 
     if len(sys.argv) >= 3:

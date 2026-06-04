@@ -531,19 +531,7 @@ def run_sundayobserver_incremental() -> int:
 
 
 def run_dinamina_incremental() -> int:
-    mod = _import_scraper("dinamina_selenium_json")
-    cats = ["local", "politics", "editorial", "sports", "features", "business"]
-    pages = [(c, f"https://www.dinamina.lk/category/{c}/") for c in cats]
-    collect = lambda d, u: collect_wp_category_links(d, u, "dinamina")
-
-    return run_incremental_scraper(
-        outlet_name="Dinamina",
-        data_filename="dinamina_latest_news.json",
-        pages=pages,
-        collect_links=collect,
-        fetch_article=lambda d, l: _fetch_content(d, l, mod),
-        use_undetected=True,
-    )
+    return _import_scraper("dinamina_selenium_json").main_incremental()
 
 
 def run_divaina_incremental() -> int:
