@@ -21,7 +21,8 @@ from incremental import (
     reached_section_incremental_limit,
     save_replace_only,
     normalize_link,
-    update_section_checkpoints,
+    apply_section_head_checkpoints,
+    migrate_global_checkpoint_to_sections,
 )
 
 ISLAND_CATEGORIES = [
@@ -336,6 +337,7 @@ def main_incremental():
     """Per-section checkpoints — each category page tracks its own newest article."""
     json_filename = _data_json_path()
     section_keys = [c[0] for c in ISLAND_CATEGORIES]
+    migrate_global_checkpoint_to_sections(json_filename, section_keys)
     bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
     max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
@@ -429,25 +431,13 @@ def main_incremental():
 
             time.sleep(0.5)
 
-        # Checkpoint = newest article in this category's listing (not site-wide nav hero)
-        if links:
-            head_url = links[0]
-            head_title = ""
-            head_norm = normalize_link(head_url)
-            for a in new_articles:
-                if normalize_link(a.get("link", "")) == head_norm:
-                    head_title = a.get("title", "") or ""
-                    break
-            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
-            print(f"  [CKPT] {name} newest on page: {head_url[:70]}")
-
-    # Sections skipped due to cap — seed from Phase 1 head link
-    for name, links in section_links.items():
-        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
-        if not sec_ckpt and links:
-            seed_url = _canonical_island_url(links[0])
-            update_section_checkpoints(json_filename, {name: (seed_url, "")})
-            print(f"[SEED] {name}: {seed_url[:80]}")
+    apply_section_head_checkpoints(
+        json_filename,
+        section_links,
+        new_articles,
+        section_keys=section_keys,
+        link_transform=_canonical_island_url,
+    )
 
     driver.quit()
     print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")

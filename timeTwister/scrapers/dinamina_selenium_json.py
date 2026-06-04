@@ -36,6 +36,8 @@ from incremental import (
     normalize_link,
     reached_section_incremental_limit,
     save_replace_only,
+    apply_section_head_checkpoints,
+    migrate_global_checkpoint_to_sections,
     update_section_checkpoints,
 )
 from incremental_runner import article_from_content, data_json_path
@@ -1127,6 +1129,7 @@ def main_incremental_rss() -> int:
     """Per-section checkpoints via RSS (GHA — Cloudflare blocks Selenium)."""
     json_filename = data_json_path("dinamina_latest_news.json")
     section_keys = [c[0] for c in DINAMINA_CATEGORIES]
+    migrate_global_checkpoint_to_sections(json_filename, section_keys)
     bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
     max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
@@ -1201,25 +1204,12 @@ def main_incremental_rss() -> int:
             )
             section_stopped.add(sec)
 
-    for name in section_keys:
-        links = section_links.get(name, [])
-        if not links:
-            continue
-        head_url = links[0]
-        head_title = ""
-        for a in all_feed:
-            if a.get("link") == head_url or normalize_link(a.get("link", "")) == normalize_link(head_url):
-                head_title = a.get("title", "") or ""
-                break
-        update_section_checkpoints(json_filename, {name: (head_url, head_title)})
-        print(f"  [CKPT] {name} newest in feed: {head_url[:70]}")
-
-    for name in section_keys:
-        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
-        links = section_links.get(name, [])
-        if not sec_ckpt and links:
-            update_section_checkpoints(json_filename, {name: (links[0], "")})
-            print(f"[SEED] {name}: {links[0][:80]}")
+    apply_section_head_checkpoints(
+        json_filename,
+        section_links,
+        all_feed,
+        section_keys=section_keys,
+    )
 
     print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
     save_replace_only(json_filename, new_articles)
@@ -1235,6 +1225,7 @@ def main_incremental_selenium() -> int:
     """Per-section checkpoints — Selenium (local / non-blocked environments)."""
     json_filename = data_json_path("dinamina_latest_news.json")
     section_keys = [c[0] for c in DINAMINA_CATEGORIES]
+    migrate_global_checkpoint_to_sections(json_filename, section_keys)
     bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
     max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
 
@@ -1315,22 +1306,12 @@ def main_incremental_selenium() -> int:
 
             time.sleep(0.5)
 
-        if links:
-            head_url = links[0]
-            head_title = ""
-            head_norm = normalize_link(head_url)
-            for a in new_articles:
-                if normalize_link(a.get("link", "")) == head_norm:
-                    head_title = a.get("title", "") or ""
-                    break
-            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
-            print(f"  [CKPT] {name} newest on page: {head_url[:70]}")
-
-    for name, links in section_links.items():
-        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
-        if not sec_ckpt and links:
-            update_section_checkpoints(json_filename, {name: (links[0], "")})
-            print(f"[SEED] {name}: {links[0][:80]}")
+    apply_section_head_checkpoints(
+        json_filename,
+        section_links,
+        new_articles,
+        section_keys=section_keys,
+    )
 
     try:
         driver.quit()

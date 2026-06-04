@@ -20,8 +20,12 @@ from incremental import (
     INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
     INCREMENTAL_RUN_LIMIT,
     INCREMENTAL_RUN_LIMIT_PER_SECTION,
+    get_section_checkpoint,
     load_incremental_boundary_links,
+    load_known_links,
     merge_and_save,
+    apply_section_head_checkpoints,
+    migrate_global_checkpoint_to_sections,
     normalize_link,
     save_replace_only,
     should_stop_at_feed_item,
@@ -177,6 +181,33 @@ def article_from_metadata(metadata: dict[str, Any], link: str) -> dict[str, Any]
     }
 
 
+def _finalize_incremental_save(
+    json_path: str,
+    new_articles: list[dict[str, Any]],
+    *,
+    outlet_name: str,
+    save_mode: str,
+    before_save: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None,
+) -> int:
+    new_articles = [
+        a
+        for a in new_articles
+        if (a.get("title") or "").strip()
+        or (a.get("summary") or a.get("description") or "").strip()
+    ]
+    print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
+    if before_save and new_articles:
+        new_articles = before_save(new_articles)
+    if save_mode == "merge":
+        merge_and_save(json_path, new_articles)
+    elif new_articles:
+        save_replace_only(json_path, new_articles)
+    else:
+        print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
+    print(f"[INCREMENTAL] {outlet_name} finished.")
+    return len(new_articles)
+
+
 def run_incremental_scraper(
     *,
     outlet_name: str,
@@ -196,12 +227,31 @@ def run_incremental_scraper(
 ) -> int:
     """
     Scrape list pages top-to-bottom; stop at last checkpoint URL.
+    Multi-page outlets use per-section checkpoints (each category independently).
     Returns count of new articles saved this run.
     """
     json_path = data_json_path(data_filename)
+    per_section = per_section_limit if per_section_limit is not None else len(pages) > 1
+
+    if per_section and len(pages) > 1:
+        return _run_incremental_scraper_per_section(
+            outlet_name=outlet_name,
+            json_path=json_path,
+            pages=pages,
+            collect_links=collect_links,
+            fetch_article=fetch_article,
+            create_driver=create_driver,
+            bootstrap_limit=bootstrap_limit,
+            run_limit=run_limit,
+            sleep_between_articles=sleep_between_articles,
+            sleep_after_list_page=sleep_after_list_page,
+            use_undetected=use_undetected,
+            save_mode=save_mode,
+            before_save=before_save,
+        )
+
     checkpoint_link, known_previous = load_incremental_boundary_links(json_path)
     bootstrap = not checkpoint_link
-    per_section = per_section_limit if per_section_limit is not None else len(pages) > 1
     if bootstrap:
         max_articles = (
             bootstrap_limit
@@ -320,21 +370,141 @@ def run_incremental_scraper(
     finally:
         driver.quit()
 
-    # Drop empty shells (failed article-page extract on CI)
-    new_articles = [
-        a
-        for a in new_articles
-        if (a.get("title") or "").strip() or (a.get("summary") or a.get("description") or "").strip()
-    ]
+    return _finalize_incremental_save(
+        json_path,
+        new_articles,
+        outlet_name=outlet_name,
+        save_mode=save_mode,
+        before_save=before_save,
+    )
 
-    print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
-    if before_save and new_articles:
-        new_articles = before_save(new_articles)
-    if save_mode == "merge":
-        merge_and_save(json_path, new_articles)
-    elif new_articles:
-        save_replace_only(json_path, new_articles)
+
+def _run_incremental_scraper_per_section(
+    *,
+    outlet_name: str,
+    json_path: str,
+    pages: list[tuple[str, str]],
+    collect_links: CollectLinksFn,
+    fetch_article: FetchArticleFn,
+    create_driver: CreateDriverFn | None,
+    bootstrap_limit: int | None,
+    run_limit: int | None,
+    sleep_between_articles: float,
+    sleep_after_list_page: float,
+    use_undetected: bool,
+    save_mode: str,
+    before_save: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None,
+) -> int:
+    section_keys = [name for name, _ in pages]
+    migrate_global_checkpoint_to_sections(json_path, section_keys)
+    bootstrap = not any(get_section_checkpoint(json_path, k)[0] for k in section_keys)
+    if bootstrap:
+        max_articles = (
+            bootstrap_limit
+            if bootstrap_limit is not None
+            else INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION
+        )
     else:
-        print("[INCREMENTAL] No new articles — keeping existing data file unchanged")
-    print(f"[INCREMENTAL] {outlet_name} finished.")
-    return len(new_articles)
+        max_articles = (
+            run_limit if run_limit is not None else INCREMENTAL_RUN_LIMIT_PER_SECTION
+        )
+
+    known_previous = load_known_links(json_path)
+    if known_previous:
+        print(
+            f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file"
+        )
+
+    print(f"[INCREMENTAL] {outlet_name} — per-section checkpoints")
+    if bootstrap:
+        print(f"[INCREMENTAL] No section checkpoint; bootstrap max {max_articles} per section")
+    else:
+        print(
+            f"[INCREMENTAL] Run safety cap: {max_articles} new articles per section "
+            "(if section checkpoint not found on feed)"
+        )
+
+    driver_factory = create_driver or (lambda: create_standard_driver(use_undetected))
+    driver = driver_factory()
+    new_articles: list[dict[str, Any]] = []
+    seen_this_run: set[str] = set()
+    section_links: dict[str, list[str]] = {}
+
+    try:
+        print("\n[INCREMENTAL] Phase 1 — list pages")
+        for name, page_url in pages:
+            print(f"\n{'=' * 50}\n[INCREMENTAL] {outlet_name} / {name}\n{page_url}")
+            try:
+                links = collect_links(driver, page_url)
+                section_links[name] = links
+                print(f"[INFO] {len(links)} links on list page")
+            except Exception as e:
+                print(f"[ERROR] List page failed ({name}): {e}")
+                section_links[name] = []
+            if sleep_after_list_page:
+                time.sleep(sleep_after_list_page)
+
+        print("\n[INCREMENTAL] Phase 2 — fetch new articles per section")
+        for name, _page_url in pages:
+            links = section_links.get(name, [])
+            sec_ckpt, _ = get_section_checkpoint(json_path, name)
+            print(
+                f"\n[PHASE 2] {name} — checkpoint: "
+                f"{(sec_ckpt or 'None')[:70]}"
+            )
+            page_new = 0
+
+            for i, link in enumerate(links, 1):
+                norm = normalize_link(link)
+                if sec_ckpt and norm == normalize_link(sec_ckpt):
+                    print("  [STOP] Reached section checkpoint")
+                    break
+                if norm in known_previous:
+                    print(f"  [STOP] Already in previous run: {link[:70]}")
+                    break
+                if norm in seen_this_run:
+                    continue
+
+                print(f"\n[INFO] New {i}: {link[:80]}...")
+                try:
+                    row = fetch_article(driver, link)
+                    if row:
+                        title = (row.get("title") or "").strip()
+                        summary = (
+                            (row.get("summary") or row.get("description") or "")
+                        ).strip()
+                        if not title and not summary:
+                            print(f"[SKIP] Empty row (no title/body): {link[:80]}...")
+                            continue
+                        new_articles.append(row)
+                        seen_this_run.add(norm)
+                        page_new += 1
+                except Exception as e:
+                    print(f"[ERROR] Article failed: {e}")
+
+                if page_new >= max_articles:
+                    label = "Bootstrap" if bootstrap else "Run safety"
+                    print(
+                        f"[INCREMENTAL] {label} limit ({max_articles}) "
+                        f"for {name} — next section"
+                    )
+                    break
+
+                time.sleep(sleep_between_articles)
+
+        apply_section_head_checkpoints(
+            json_path,
+            section_links,
+            new_articles,
+            section_keys=section_keys,
+        )
+    finally:
+        driver.quit()
+
+    return _finalize_incremental_save(
+        json_path,
+        new_articles,
+        outlet_name=outlet_name,
+        save_mode=save_mode,
+        before_save=before_save,
+    )

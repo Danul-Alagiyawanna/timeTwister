@@ -382,7 +382,8 @@ def run_themorning_incremental() -> int:
         normalize_link,
         reached_section_incremental_limit,
         save_replace_only,
-        update_section_checkpoints,
+        apply_section_head_checkpoints,
+        migrate_global_checkpoint_to_sections,
     )
     from incremental_runner import create_standard_driver
 
@@ -392,6 +393,7 @@ def run_themorning_incremental() -> int:
     json_path = data_json_path("themorning_latest_news.json")
 
     # bootstrap = no section has a checkpoint yet
+    migrate_global_checkpoint_to_sections(json_path, cats)
     bootstrap = not any(get_section_checkpoint(json_path, c)[0] for c in cats)
     max_per_section = incremental_fetch_limit(bootstrap=bootstrap, per_section=True)
     known_previous = load_known_links(json_path)
@@ -463,24 +465,12 @@ def run_themorning_incremental() -> int:
 
             time.sleep(0.5)
 
-        # Checkpoint = newest article on the category page (links[0]), not oldest scraped
-        if links:
-            head_title = ""
-            if new_articles:
-                head_norm = normalize_link(links[0])
-                for a in new_articles:
-                    if normalize_link(a.get("link", "")) == head_norm:
-                        head_title = a.get("title", "") or ""
-                        break
-            update_section_checkpoints(json_path, {cat: (links[0], head_title)})
-            print(f"  [CKPT] {cat} newest on page: {links[0][:70]}")
-
-    # Sections with no checkpoint yet — seed from Phase 1 head link
-    for cat, links in section_links.items():
-        sec_ckpt, _ = get_section_checkpoint(json_path, cat)
-        if not sec_ckpt and links:
-            update_section_checkpoints(json_path, {cat: (links[0], "")})
-            print(f"[SEED] {cat}: {links[0][:80]}")
+    apply_section_head_checkpoints(
+        json_path,
+        section_links,
+        new_articles,
+        section_keys=cats,
+    )
 
     driver.quit()
 
