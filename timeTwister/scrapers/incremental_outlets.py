@@ -389,26 +389,99 @@ def run_economynext_incremental() -> int:
 
 
 def run_themorning_incremental() -> int:
+    """Per-section checkpoints — each category tracks its own last-scraped URL."""
+    from incremental import (
+        INCREMENTAL_BOOTSTRAP_LIMIT,
+        INCREMENTAL_RUN_LIMIT,
+        get_section_checkpoint,
+        load_checkpoint_state,
+        load_known_links,
+        normalize_link,
+        save_replace_only,
+        update_section_checkpoints,
+    )
+    from incremental_runner import create_standard_driver
+
     mod = _import_scraper("themorning_selenium_json")
     cats = ["news", "opinion", "business", "features", "sports", "world"]
     pages = [(c, f"https://www.themorning.lk/categories/{c}") for c in cats]
+    json_path = data_json_path("themorning_latest_news.json")
 
-    def collect(d, url):
-        d.get(url)
-        time.sleep(3)
-        return mod.get_main_article_links(d)
+    checkpoint_state = load_checkpoint_state(json_path)
+    bootstrap = not any(get_section_checkpoint(checkpoint_state, c) for c in cats)
+    max_articles = INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
+    known_previous = load_known_links(json_path)
+    if known_previous:
+        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
 
-    def fetch(d, link):
-        return _fetch_metadata(d, link, mod)
+    print("[INCREMENTAL] The Morning — per-section checkpoints")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
 
-    return run_incremental_scraper(
-        outlet_name="The Morning",
-        data_filename="themorning_latest_news.json",
-        pages=pages,
-        collect_links=collect,
-        fetch_article=fetch,
-        use_undetected=False,
-    )
+    driver = create_standard_driver(use_undetected=False)
+
+    # Phase 1: collect links for every section; seed any missing checkpoints
+    section_links: dict[str, list[str]] = {}
+    for cat, url in pages:
+        print(f"\n[PHASE 1] {cat}: {url}")
+        try:
+            driver.get(url)
+            time.sleep(3)
+            links = mod.get_main_article_links(driver)
+            section_links[cat] = links
+            print(f"  {len(links)} links")
+            if not get_section_checkpoint(checkpoint_state, cat) and links:
+                update_section_checkpoints(checkpoint_state, cat, links[0])
+                print(f"  [SEED] {links[0][:80]}")
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            section_links[cat] = []
+
+    # Phase 2: fetch new articles per section up to cap
+    new_articles: list[dict] = []
+    seen_this_run: set[str] = set()
+    cap_hit = False
+
+    for cat, _url in pages:
+        if cap_hit:
+            break
+        links = section_links.get(cat, [])
+        sec_ckpt = get_section_checkpoint(checkpoint_state, cat)
+        print(f"\n[PHASE 2] {cat} — checkpoint: {(sec_ckpt or 'None')[:70]}")
+
+        for link in links:
+            norm = normalize_link(link)
+            if sec_ckpt and normalize_link(sec_ckpt) == norm:
+                print(f"  [STOP] Reached section checkpoint")
+                break
+            if norm in known_previous or norm in seen_this_run:
+                continue
+            try:
+                meta = _fetch_metadata(driver, link, mod)
+                if meta and (meta.get("title") or meta.get("summary")):
+                    new_articles.append(meta)
+                    seen_this_run.add(norm)
+                    update_section_checkpoints(checkpoint_state, cat, link)
+                    print(f"  [+] {meta.get('title', '')[:70]}")
+            except Exception as e:
+                print(f"  [ERROR] {e}")
+
+            if len(new_articles) >= max_articles:
+                label = "Bootstrap" if bootstrap else "Run safety"
+                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
+                cap_hit = True
+                break
+
+            time.sleep(0.5)
+
+    driver.quit()
+
+    print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
+    save_replace_only(json_path, new_articles)
+    print("[INCREMENTAL] The Morning finished.")
+    return len(new_articles)
 
 
 def run_sundayobserver_incremental() -> int:
