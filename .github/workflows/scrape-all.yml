@@ -128,7 +128,12 @@ jobs:
         env:
           SCRAPE_MODE: incremental
           CI: "true"
-        run: python scrapers/${{ matrix.module }}.py --incremental
+        run: |
+          if [ "${{ matrix.id }}" = "dinamina" ]; then
+            xvfb-run -a python scrapers/${{ matrix.module }}.py --incremental
+          else
+            python scrapers/${{ matrix.module }}.py --incremental
+          fi
 
       - name: Run date-range scraper (xvfb)
         if: matrix.incremental != true

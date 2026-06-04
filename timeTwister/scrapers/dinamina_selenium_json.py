@@ -38,7 +38,7 @@ from incremental import (
     save_replace_only,
     update_section_checkpoints,
 )
-from incremental_runner import article_from_content, create_standard_driver, data_json_path
+from incremental_runner import article_from_content, data_json_path
 
 DINAMINA_CATEGORIES = [
     ("local", "https://www.dinamina.lk/category/local/"),
@@ -60,20 +60,189 @@ except AttributeError:
 BASE_URL = "https://www.dinamina.lk/category/local/"
 
 
-def get_category_article_links(driver) -> list[str]:
-    """Ordered article URLs from a Dinamina category listing page."""
+_ARTICLE_PATH_RE = re.compile(r"/20\d{2}/\d{1,2}/\d{1,2}/")
+
+
+def _chrome_major_version() -> int | None:
+    """Installed Chrome major version (GHA + local)."""
+    import subprocess
+
+    for cmd in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        try:
+            out = subprocess.check_output([cmd, "--version"], text=True, timeout=10)
+            m = re.search(r"(\d+)\.", out)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            continue
+    return None
+
+
+def _heading_xpath_for_index(article_idx: int) -> str:
+    """Same layout as process_articles_from_page."""
+    if article_idx == 0:
+        return "/html/body/div[1]/div[3]/div[1]/div/ul/section/article/div[2]/div[1]/h2/a"
+    if article_idx <= 4:
+        li_idx = article_idx
+        return f"/html/body/div[1]/div[3]/div[1]/div/ul/li[{li_idx}]/article/div[2]/h2/a"
+    li_idx = article_idx
+    return f"/html/body/div[1]/div[3]/div[1]/div/ul/li[{li_idx}]/article/div[2]/div/h2/a"
+
+
+def _bs_fallback_category_links(driver) -> list[str]:
+    """Fallback when XPath misses (e.g. plain headless HTML differs)."""
     soup = BeautifulSoup(driver.page_source, "html.parser")
     base = "https://www.dinamina.lk"
     links: list[str] = []
     seen: set[str] = set()
-    for a in soup.select("ul li article h2 a, section article h2 a, ul section article h2 a"):
+    for a in soup.select(
+        "ul section article h2 a, ul li article h2 a, ul li article div h2 a, article h2 a"
+    ):
         href = a.get("href") or ""
         if href.startswith("/"):
             href = base + href
         if href.startswith("http") and "dinamina" in href and href not in seen:
+            if _ARTICLE_PATH_RE.search(href):
+                seen.add(href)
+                links.append(href)
+    if links:
+        return links
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("/"):
+            href = base + href
+        if (
+            href.startswith("http")
+            and "dinamina.lk" in href
+            and "category" not in href
+            and _ARTICLE_PATH_RE.search(href)
+            and href not in seen
+        ):
             seen.add(href)
             links.append(href)
     return links
+
+
+def get_category_article_links(driver, max_links: int = 25) -> list[str]:
+    """Ordered article URLs — XPath first (matches full scrape), then BS fallback."""
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+    driver.execute_script("window.scrollTo(0, 0);")
+    time.sleep(1)
+
+    links: list[str] = []
+    seen: set[str] = set()
+    scroll_increment = 600
+    consecutive_not_found = 0
+    max_consecutive_not_found = 3
+
+    for article_idx in range(max_links):
+        if consecutive_not_found >= max_consecutive_not_found:
+            break
+
+        heading_xpath = _heading_xpath_for_index(article_idx)
+        found = False
+        for scroll_attempt in range(8):
+            try:
+                el = driver.find_element(By.XPATH, heading_xpath)
+                href = (el.get_attribute("href") or "").strip()
+                if href and href not in seen:
+                    seen.add(href)
+                    links.append(href)
+                    found = True
+                    consecutive_not_found = 0
+                    break
+            except Exception:
+                if scroll_attempt < 7:
+                    driver.execute_script(f"window.scrollBy(0, {scroll_increment});")
+                    time.sleep(0.8)
+
+        if not found:
+            consecutive_not_found += 1
+
+    if not links:
+        links = _bs_fallback_category_links(driver)
+        if not links:
+            title = driver.title or ""
+            print(
+                f"  [WARN] 0 links — title={title[:60]!r} "
+                f"html={len(driver.page_source)} bytes"
+            )
+    return links
+
+
+def _create_dinamina_driver():
+    """UC with version_main retry — same strategy as full main(), works on GHA."""
+    if USE_UNDETECTED:
+        print("[INFO] Using undetected-chromedriver...")
+        options = uc.ChromeOptions()
+        options.page_load_strategy = "eager"
+        options.add_experimental_option(
+            "prefs", {"profile.default_content_setting_values": {"popups": 1}}
+        )
+        if os.getenv("CI"):
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+
+        major = _chrome_major_version()
+        attempts: list[tuple[str, dict]] = [("auto", {})]
+        if major:
+            attempts.insert(0, (f"version_main={major}", {"version_main": major}))
+
+        last_err: Exception | None = None
+        for label, kwargs in attempts:
+            try:
+                print(f"[INFO] Starting undetected Chrome ({label})...")
+                driver = uc.Chrome(options=options, use_subprocess=True, **kwargs)
+                print("[INFO] Undetected Chrome started successfully")
+                driver.execute_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
+                return driver
+            except Exception as e:
+                last_err = e
+                err_msg = str(e)
+                print(f"[WARNING] UC failed ({label}): {err_msg[:200]}")
+                m = re.search(r"Current browser version is (\d+)", err_msg)
+                if m:
+                    v = int(m.group(1))
+                    try:
+                        driver = uc.Chrome(
+                            options=options, use_subprocess=True, version_main=v
+                        )
+                        print(f"[INFO] UC started with version_main={v} from error")
+                        driver.execute_script(
+                            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                        )
+                        return driver
+                    except Exception as e2:
+                        last_err = e2
+
+        print(f"[WARNING] UC unavailable: {last_err}")
+
+    print("[INFO] Falling back to regular Selenium...")
+    chrome_options = Options()
+    chrome_options.page_load_strategy = "eager"
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+    chrome_options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    chrome_options.add_experimental_option(
+        "prefs", {"profile.default_content_setting_values": {"popups": 1}}
+    )
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()), options=chrome_options
+    )
+    driver.execute_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    return driver
 
 
 class TimeoutError(Exception):
@@ -662,7 +831,7 @@ def main_incremental() -> int:
     else:
         print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
 
-    driver = create_standard_driver(use_undetected=USE_UNDETECTED)
+    driver = _create_dinamina_driver()
     driver.set_page_load_timeout(60)
 
     section_links: dict[str, list[str]] = {}
@@ -670,7 +839,6 @@ def main_incremental() -> int:
         print(f"\n[PHASE 1] {name}: {url}")
         try:
             driver.get(url.rstrip("/") + "/")
-            time.sleep(3)
             links = get_category_article_links(driver)
             section_links[name] = links
             print(f"  {len(links)} links")

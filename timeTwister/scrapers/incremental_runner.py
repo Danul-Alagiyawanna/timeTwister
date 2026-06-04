@@ -87,8 +87,8 @@ def create_standard_driver(use_undetected: bool = True) -> Any:
             except Exception as first_err:
                 # Detect Chrome version from error message and retry
                 err_msg = str(first_err)
-                match = _re.search(r"Current browser version is (\d+)", err_msg) or \
-                        _re.search(r"only supports Chrome version (\d+)", err_msg)
+                # Use installed Chrome version only — not chromedriver's "supports version N"
+                match = _re.search(r"Current browser version is (\d+)", err_msg)
                 if match:
                     major = int(match.group(1))
                     print(f"[INFO] UC version mismatch; retrying with version_main={major}")
