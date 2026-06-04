@@ -447,23 +447,24 @@ def run_themorning_incremental() -> int:
         links = section_links.get(cat, [])
         sec_ckpt, _ = get_section_checkpoint(json_path, cat)
         print(f"\n[PHASE 2] {cat} — checkpoint: {(sec_ckpt or 'None')[:70]}")
-        first_in_section = True
 
         for link in links:
             norm = normalize_link(link)
             if sec_ckpt and normalize_link(sec_ckpt) == norm:
                 print(f"  [STOP] Reached section checkpoint")
                 break
-            if norm in known_previous or norm in seen_this_run:
+            # replace-only: previous file = last batch; feed is newest-first —
+            # hitting a known URL means everything below is already saved → stop section
+            if norm in known_previous:
+                print(f"  [STOP] Already in previous run: {link[:70]}")
+                break
+            if norm in seen_this_run:
                 continue
             try:
                 meta = _fetch_metadata(driver, link, mod)
                 if meta and (meta.get("title") or meta.get("summary")):
                     new_articles.append(meta)
                     seen_this_run.add(norm)
-                    if first_in_section:
-                        update_section_checkpoints(json_path, {cat: (link, meta.get("title", ""))})
-                        first_in_section = False
                     print(f"  [+] {meta.get('title', '')[:70]}")
             except Exception as e:
                 print(f"  [ERROR] {e}")
@@ -476,8 +477,19 @@ def run_themorning_incremental() -> int:
 
             time.sleep(0.5)
 
-    # Post-Phase 2: seed any sections still without a checkpoint so future runs
-    # don't re-scrape old content from sections the cap prevented us from reaching
+        # Checkpoint = newest article on the category page (links[0]), not oldest scraped
+        if links:
+            head_title = ""
+            if new_articles:
+                head_norm = normalize_link(links[0])
+                for a in new_articles:
+                    if normalize_link(a.get("link", "")) == head_norm:
+                        head_title = a.get("title", "") or ""
+                        break
+            update_section_checkpoints(json_path, {cat: (links[0], head_title)})
+            print(f"  [CKPT] {cat} newest on page: {links[0][:70]}")
+
+    # Sections never reached (global cap) — seed from Phase 1 head link
     for cat, links in section_links.items():
         sec_ckpt, _ = get_section_checkpoint(json_path, cat)
         if not sec_ckpt and links:
