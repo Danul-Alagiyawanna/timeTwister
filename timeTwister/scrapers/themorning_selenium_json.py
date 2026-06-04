@@ -148,13 +148,17 @@ def get_main_article_links(driver):
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     # Find all main news grid containers
     main_grids = soup.find_all('div', class_=['grid', 'grid-cols-8', 'gap-4', 'mb-10'])
-    links = set()
+    links = []
+    seen = set()
     for grid in main_grids:
         for a in grid.find_all('a', href=True):
             href = a['href']
             if href.startswith('/articles/'):
-                links.add('https://www.themorning.lk' + href)
-    return list(links)
+                full_url = 'https://www.themorning.lk' + href
+                if full_url not in seen:
+                    seen.add(full_url)
+                    links.append(full_url)
+    return links
 
 def extract_image_url(soup, base_url):
     """Extract image URL using multiple strategies"""

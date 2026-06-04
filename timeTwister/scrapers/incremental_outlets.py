@@ -430,8 +430,7 @@ def run_themorning_incremental() -> int:
             driver.get(url)
             time.sleep(3)
             links = mod.get_main_article_links(driver)
-            # preserve deterministic order — get_main_article_links uses a set internally
-            section_links[cat] = list(dict.fromkeys(links))
+            section_links[cat] = links
             print(f"  {len(links)} links")
         except Exception as e:
             print(f"  [ERROR] {e}")
