@@ -814,8 +814,359 @@ def process_articles_from_page(driver, list_url, start_date, end_date):
     return articles_found, articles_in_range, articles_outside_range
 
 
-def main_incremental() -> int:
-    """Per-section checkpoints — each category tracks its newest article."""
+def _link_to_section(link: str) -> str | None:
+    """Map article URL path segment to DINAMINA_CATEGORIES key."""
+    m2 = re.search(r"/20\d{2}/\d{1,2}/\d{1,2}/([^/]+)/", link, re.I)
+    if not m2:
+        return None
+    slug = m2.group(1).lower()
+    if slug == "featured":
+        return "features"
+    valid = {c[0] for c in DINAMINA_CATEGORIES}
+    return slug if slug in valid else None
+
+
+def _http_get(url: str, **kwargs):
+    """requests + curl_cffi fallback (works on GHA for /feed/)."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    import requests as req
+
+    try:
+        r = req.get(url, timeout=20, allow_redirects=True, headers=headers, **kwargs)
+        if r.status_code == 200 and len(r.text) > 200:
+            return r
+        print(f"[WARN] requests {r.status_code} for {url}")
+    except Exception as e:
+        print(f"[WARN] requests failed: {e}")
+    for profile in ("chrome124", "safari17_0", "firefox133"):
+        try:
+            from curl_cffi import requests as cf_req  # type: ignore
+
+            r = cf_req.get(url, impersonate=profile, timeout=20, headers=headers, **kwargs)
+            if r.status_code == 200 and len(r.text) > 200:
+                print(f"[INFO] curl_cffi ({profile}) OK for {url}")
+                return r
+        except Exception as e:
+            print(f"[WARN] curl_cffi ({profile}): {e}")
+            break
+    return None
+
+
+def _html_to_plain(html: str) -> str:
+    if not html:
+        return ""
+    try:
+        return BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
+    except Exception:
+        return html.strip()
+
+
+def _first_img_from_html(html: str) -> str:
+    if not html:
+        return ""
+    for pattern in (
+        r'<img[^>]+src=["\']([^"\']+)["\']',
+        r'<img[^>]+data-src=["\']([^"\']+)["\']',
+    ):
+        m = re.search(pattern, html, re.I)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _build_dinamina_article_row(
+    *,
+    title: str,
+    link: str,
+    date_str: str,
+    body_text: str,
+    image_url: str = "",
+    author: str = "",
+    rss_categories: list[str] | None = None,
+    guid: str = "",
+    date_source: str = "",
+) -> dict:
+    """Align RSS rows with full-scrape JSON (title, link, summary, description, date, image)."""
+    section = _link_to_section(link) or ""
+    row = {
+        "title": title,
+        "link": link,
+        "summary": body_text,
+        "description": body_text,
+        "date": date_str,
+        "image_url": image_url,
+        "date_source": date_source or f"RSS: {date_str}",
+    }
+    if section:
+        row["section"] = section
+    if author:
+        row["author"] = author
+    if rss_categories:
+        row["rss_categories"] = rss_categories
+    if guid:
+        row["guid"] = guid
+    return row
+
+
+def _parse_dinamina_rss(xml_text: str) -> list[dict]:
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    ns = {
+        "content": "http://purl.org/rss/1.0/modules/content/",
+        "dc": "http://purl.org/dc/elements/1.1/",
+        "media": "http://search.yahoo.com/mrss/",
+    }
+    articles: list[dict] = []
+    root = ET.fromstring(xml_text)
+    for item in root.findall(".//item"):
+        link = (item.findtext("link") or "").strip()
+        if not link or "dinamina.lk" not in link:
+            continue
+        title = (item.findtext("title") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if pub_date:
+            try:
+                date_str = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+
+        desc_html = (item.findtext("description") or "").strip()
+        content_el = item.find("content:encoded", ns)
+        content_html = (content_el.text or "").strip() if content_el is not None else ""
+        body_text = _html_to_plain(content_html) or _html_to_plain(desc_html)
+
+        image_url = ""
+        thumb = item.find("media:thumbnail", ns)
+        if thumb is not None and thumb.get("url"):
+            image_url = thumb.get("url", "").strip()
+        enclosure = item.find("enclosure")
+        if not image_url and enclosure is not None and enclosure.get("type", "").startswith("image"):
+            image_url = (enclosure.get("url") or "").strip()
+        if not image_url:
+            image_url = _first_img_from_html(content_html) or _first_img_from_html(desc_html)
+
+        author_el = item.find("dc:creator", ns)
+        author = (author_el.text or "").strip() if author_el is not None else ""
+        rss_categories = [
+            (c.text or "").strip() for c in item.findall("category") if (c.text or "").strip()
+        ]
+        guid = (item.findtext("guid") or "").strip()
+
+        articles.append(
+            _build_dinamina_article_row(
+                title=title,
+                link=link,
+                date_str=date_str,
+                body_text=body_text,
+                image_url=image_url,
+                author=author,
+                rss_categories=rss_categories,
+                guid=guid,
+                date_source=f"RSS: {date_str}",
+            )
+        )
+    return articles
+
+
+def _fetch_dinamina_feed_articles() -> list[dict]:
+    """Main site RSS + Google News fallback (no Cloudflare browser needed)."""
+    import base64 as b64_mod
+
+    feed_url = "https://www.dinamina.lk/feed/"
+    resp = _http_get(feed_url)
+    if resp:
+        print(f"[INFO] RSS fetched ({len(resp.text)} bytes)")
+        try:
+            items = _parse_dinamina_rss(resp.text)
+            if items:
+                print(f"[INFO] RSS parsed {len(items)} items")
+                return items
+        except Exception as e:
+            print(f"[WARN] RSS parse error: {e}")
+
+    print("[INFO] RSS unavailable — trying Google News RSS...")
+    gnews = (
+        "https://news.google.com/rss/search?q=site:dinamina.lk&hl=en-US&gl=US&ceid=US:en"
+    )
+    resp = _http_get(gnews)
+    if not resp:
+        return []
+
+    def _decode_gnews_url(gnews_url: str) -> str:
+        m = re.search(r"/articles/([^?&#]+)", gnews_url)
+        if not m:
+            return gnews_url
+        try:
+            padded = m.group(1) + "=" * (-len(m.group(1)) % 4)
+            raw = b64_mod.urlsafe_b64decode(padded)
+            urls = re.findall(rb"https?://[^\x00-\x1f\x7f-\xff ]+", raw)
+            if urls:
+                return urls[0].decode("utf-8").rstrip(".")
+        except Exception:
+            pass
+        return gnews_url
+
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    items_out: list[dict] = []
+    root = ET.fromstring(resp.text)
+    for item in root.findall(".//item"):
+        gnews_link = (item.findtext("link") or "").strip()
+        link = _decode_gnews_url(gnews_link)
+        if "dinamina.lk" not in link:
+            link = gnews_link
+        title = (item.findtext("title") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if pub_date:
+            try:
+                date_str = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        desc_html = (item.findtext("description") or "").strip()
+        desc_text = _html_to_plain(desc_html)
+        image_url = _first_img_from_html(desc_html)
+        # Enrich from article page when not Cloudflare-blocked
+        if "dinamina.lk" in link and (not desc_text or not image_url):
+            page = _http_get(link)
+            if page and "just a moment" not in page.text.lower():
+                psoup = BeautifulSoup(page.text, "html.parser")
+                if not desc_text:
+                    for sel in (
+                        "article .entry-content",
+                        ".entry-content",
+                        "article",
+                    ):
+                        block = psoup.select_one(sel)
+                        if block:
+                            desc_text = block.get_text(separator="\n", strip=True)
+                            if desc_text:
+                                break
+                if not image_url:
+                    og = psoup.find("meta", property="og:image")
+                    if og and og.get("content"):
+                        image_url = og["content"].strip()
+        items_out.append(
+            _build_dinamina_article_row(
+                title=title,
+                link=link,
+                date_str=date_str,
+                body_text=desc_text,
+                image_url=image_url,
+                date_source=f"GNews: {date_str}",
+            )
+        )
+    print(f"[INFO] Google News RSS returned {len(items_out)} items")
+    return items_out
+
+
+def main_incremental_rss() -> int:
+    """Per-section checkpoints via RSS (GHA — Cloudflare blocks Selenium)."""
+    json_filename = data_json_path("dinamina_latest_news.json")
+    section_keys = [c[0] for c in DINAMINA_CATEGORIES]
+    bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
+    max_articles = incremental_fetch_limit(bootstrap=bootstrap)
+
+    known_previous = load_known_links(json_filename)
+    if known_previous:
+        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
+
+    print("[INCREMENTAL] Dinamina — RSS per-section (no Selenium)")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
+
+    all_feed = _fetch_dinamina_feed_articles()
+    if not all_feed:
+        print("[ERROR] No feed items — saving empty list")
+        save_replace_only(json_filename, [])
+        return 0
+
+    section_links: dict[str, list[str]] = {k: [] for k in section_keys}
+    section_articles: dict[str, list[dict]] = {k: [] for k in section_keys}
+    for art in all_feed:
+        sec = _link_to_section(art.get("link", ""))
+        if sec and sec in section_links:
+            section_links[sec].append(art["link"])
+            section_articles[sec].append(art)
+
+    for name in section_keys:
+        print(f"[PHASE 1] {name}: {len(section_links[name])} links from feed")
+
+    new_articles: list[dict] = []
+    seen_this_run: set[str] = set()
+    cap_hit = False
+
+    for name, _url in DINAMINA_CATEGORIES:
+        if cap_hit:
+            break
+        arts = section_articles.get(name, [])
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
+
+        for i, art in enumerate(arts, 1):
+            link = art["link"]
+            norm = normalize_link(link)
+            if sec_ckpt and normalize_link(sec_ckpt) == norm:
+                print("  [STOP] Reached section checkpoint")
+                break
+            if norm in known_previous:
+                print(f"  [STOP] Already in previous run: {link[:70]}")
+                break
+            if norm in seen_this_run:
+                continue
+            if not art.get("title") and not art.get("description") and not art.get("summary"):
+                print(f"  [SKIP] Empty row: {link[:80]}")
+                continue
+
+            print(f"\n  [INFO] New {i}: {link[:80]}...")
+            new_articles.append(art)
+            seen_this_run.add(norm)
+            print(f"  [+] {(art.get('title') or '')[:70]}")
+
+            if reached_incremental_limit(len(new_articles), bootstrap=bootstrap):
+                label = "Bootstrap" if bootstrap else "Run safety"
+                print(f"[INCREMENTAL] {label} limit ({max_articles}) reached.")
+                cap_hit = True
+                break
+
+        links = section_links.get(name, [])
+        if links:
+            head_url = links[0]
+            head_title = section_articles[name][0].get("title", "") if section_articles[name] else ""
+            update_section_checkpoints(json_filename, {name: (head_url, head_title)})
+            print(f"  [CKPT] {name} newest in feed: {head_url[:70]}")
+
+    for name in section_keys:
+        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
+        links = section_links.get(name, [])
+        if not sec_ckpt and links:
+            update_section_checkpoints(json_filename, {name: (links[0], "")})
+            print(f"[SEED] {name}: {links[0][:80]}")
+
+    print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
+    save_replace_only(json_filename, new_articles)
+    return len(new_articles)
+
+
+def _page_is_cloudflare(driver) -> bool:
+    title = (driver.title or "").lower()
+    return "just a moment" in title or "attention required" in title
+
+
+def main_incremental_selenium() -> int:
+    """Per-section checkpoints — Selenium (local / non-blocked environments)."""
     json_filename = data_json_path("dinamina_latest_news.json")
     section_keys = [c[0] for c in DINAMINA_CATEGORIES]
     bootstrap = not any(get_section_checkpoint(json_filename, k)[0] for k in section_keys)
@@ -874,7 +1225,11 @@ def main_incremental() -> int:
                 time.sleep(2)
                 meta = extract_with_timeout(driver, timeout_seconds=30)
                 row = article_from_content(meta, link) if meta else None
-                if not row or (not row.get("title") and not row.get("description")):
+                if not row or (
+                    not row.get("title")
+                    and not row.get("description")
+                    and not row.get("summary")
+                ):
                     print(f"  [SKIP] Empty row: {link[:80]}")
                     continue
                 new_articles.append(row)
@@ -916,6 +1271,29 @@ def main_incremental() -> int:
     print(f"\n[INCREMENTAL] New articles: {len(new_articles)}")
     save_replace_only(json_filename, new_articles)
     return len(new_articles)
+
+
+def main_incremental() -> int:
+    """RSS on CI (Cloudflare); Selenium locally with RSS fallback."""
+    if os.getenv("CI", "").lower() in ("1", "true"):
+        print("[INCREMENTAL] CI detected — using RSS feed")
+        return main_incremental_rss()
+
+    count = main_incremental_selenium()
+    if count == 0:
+        json_filename = data_json_path("dinamina_latest_news.json")
+        try:
+            driver = _create_dinamina_driver()
+            driver.get(DINAMINA_CATEGORIES[0][1])
+            time.sleep(2)
+            cf = _page_is_cloudflare(driver)
+            driver.quit()
+        except Exception:
+            cf = True
+        if cf:
+            print("[INCREMENTAL] Cloudflare detected — falling back to RSS")
+            return main_incremental_rss()
+    return count
 
 
 def main(start_date=None, end_date=None):
