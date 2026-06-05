@@ -384,7 +384,7 @@ def merge_and_save(
 
     print(
         f"[INCREMENTAL] Saved {len(merged)} total articles "
-        f"({added} new this run) → {json_path}"
+        f"({added} new this run) -> {json_path}"
     )
     return added
 
@@ -453,16 +453,16 @@ def save_replace_only(
             newest.get("title", ""),
         )
         print(
-            f"[INCREMENTAL] Replaced file with {len(articles)} article(s) → {json_path}"
+            f"[INCREMENTAL] Replaced file with {len(articles)} article(s) -> {json_path}"
         )
     elif articles and multi_section:
         print(
-            f"[INCREMENTAL] Replaced file with {len(articles)} article(s) → {json_path}"
+            f"[INCREMENTAL] Replaced file with {len(articles)} article(s) -> {json_path}"
         )
         sync_global_checkpoint_from_sections(json_path)
     else:
         print(
-            f"[INCREMENTAL] No new articles — pipeline file cleared ([]) → {json_path}"
+            f"[INCREMENTAL] No new articles — pipeline file cleared ([]) -> {json_path}"
         )
         if multi_section:
             sync_global_checkpoint_from_sections(json_path)

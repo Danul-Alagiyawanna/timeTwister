@@ -130,6 +130,230 @@ def run_dailymirror_incremental() -> int:
     return _import_scraper("dailymirror_selenium_json").main_incremental()
 
 
+# --- EconomyNext incremental helpers (GNews redirect URLs break URL-only checkpoints) ---
+
+_EN_TITLE_SUFFIX_RE = __import__("re").compile(r"\s*[-|]\s*EconomyNext\s*$", __import__("re").I)
+
+
+def _en_normalize_title(title: str) -> str:
+    return _EN_TITLE_SUFFIX_RE.sub("", (title or "").strip()).lower()
+
+
+def _decode_gnews_url_en(gnews_url: str) -> str:
+    """Resolve Google News redirect to economynext.com when possible."""
+    import base64 as _b64
+    import re as _re
+
+    if not gnews_url or "news.google.com" not in gnews_url:
+        return gnews_url
+    try:
+        from googlenewsdecoder import gnewsdecoder  # type: ignore
+
+        result = gnewsdecoder(gnews_url)
+        decoded = (result or {}).get("decoded_url") if isinstance(result, dict) else None
+        if decoded and "economynext.com" in decoded:
+            return decoded
+    except Exception:
+        pass
+    m = _re.search(r"/articles/([^?&#]+)", gnews_url)
+    if not m:
+        return gnews_url
+    try:
+        padded = m.group(1) + "=" * (-len(m.group(1)) % 4)
+        raw = _b64.urlsafe_b64decode(padded)
+        for pat in (
+            rb"https?://(?:www\.)?economynext\.com/[^\x00-\x20\"'<>]+",
+        ):
+            fm = _re.search(pat, raw)
+            if fm:
+                return fm.group(0).decode("utf-8", errors="ignore").rstrip(".")
+    except Exception:
+        pass
+    return gnews_url
+
+
+def _canonical_economynext_link(url: str, title: str = "") -> str:
+    from incremental import normalize_link
+
+    if not url:
+        return ""
+    if "news.google.com" in url:
+        url = _decode_gnews_url_en(url)
+    if "economynext.com" in url:
+        return normalize_link(url)
+    return normalize_link(url)
+
+
+def _en_article_key(link: str, title: str) -> str:
+    from incremental import normalize_link
+
+    if link and "economynext.com" in link:
+        return "url:" + normalize_link(link)
+    title_key = _en_normalize_title(title)
+    if title_key:
+        return "title:" + title_key
+    return "url:" + normalize_link(link)
+
+
+def _en_boundary_stop_reason(
+    article: dict[str, Any],
+    checkpoint_link: str | None,
+    checkpoint_title: str | None,
+    known_keys: set[str],
+) -> str | None:
+    link = article.get("link", "")
+    title = article.get("title", "")
+    key = _en_article_key(link, title)
+
+    if checkpoint_link:
+        cp_key = _en_article_key(checkpoint_link, checkpoint_title or "")
+        if key == cp_key:
+            return "checkpoint"
+    if checkpoint_title and _en_normalize_title(title) == _en_normalize_title(
+        checkpoint_title
+    ):
+        return "checkpoint_title"
+    if key in known_keys:
+        return "known_previous"
+    return None
+
+
+def _is_cloudflare_block(html: str) -> bool:
+    if not html or len(html) < 200:
+        return True
+    markers = (
+        "cf-browser-verification",
+        "Just a moment",
+        "Attention Required! | Cloudflare",
+        "Enable JavaScript and cookies",
+    )
+    lower = html[:8000].lower()
+    return any(m.lower() in lower for m in markers)
+
+
+def _parse_economynext_rss_xml(
+    xml_text: str,
+    *,
+    date_source_prefix: str = "RSS",
+) -> list[dict[str, Any]]:
+    """Parse economynext.com/feed/ (or equivalent XML) into article dicts."""
+    import re as _re
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    from bs4 import BeautifulSoup as BS
+
+    if not xml_text or _is_cloudflare_block(xml_text):
+        return []
+    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
+    articles: list[dict[str, Any]] = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    for item in root.findall(".//item"):
+        link = (item.findtext("link") or "").strip()
+        if not link or "economynext.com" not in link:
+            continue
+        title = (item.findtext("title") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        description_html = (item.findtext("description") or "").strip()
+        content_html = (
+            item.findtext("content:encoded", namespaces=ns) or ""
+        ).strip()
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if pub_date:
+            try:
+                date_str = parsedate_to_datetime(pub_date).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            except Exception:
+                pass
+        desc_text = ""
+        if description_html:
+            try:
+                desc_text = BS(description_html, "html.parser").get_text(
+                    separator="\n", strip=True
+                )
+            except Exception:
+                desc_text = description_html
+        image_url = ""
+        if content_html:
+            m = _re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_html)
+            if m:
+                image_url = m.group(1)
+        articles.append(
+            {
+                "title": title,
+                "link": link,
+                "summary": desc_text,
+                "description": desc_text,
+                "date": date_str,
+                "image_url": image_url,
+                "date_source": f"{date_source_prefix}: {date_str}",
+            }
+        )
+    return articles
+
+
+def _en_rss_lookup(articles: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index RSS rows by canonical URL and normalized title."""
+    by_key: dict[str, dict[str, Any]] = {}
+    for art in articles:
+        link = _canonical_economynext_link(art.get("link", ""), art.get("title", ""))
+        art = {**art, "link": link}
+        by_key[_en_article_key(link, art.get("title", ""))] = art
+        title_key = _en_normalize_title(art.get("title", ""))
+        if title_key:
+            by_key.setdefault("title:" + title_key, art)
+    return by_key
+
+
+def _apply_rss_basis(
+    articles: list[dict[str, Any]],
+    rss_lookup: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replace fallback-source rows with economynext.com/feed/ data when matched."""
+    if not rss_lookup:
+        return articles
+    merged: list[dict[str, Any]] = []
+    for art in articles:
+        link = _canonical_economynext_link(art.get("link", ""), art.get("title", ""))
+        key = _en_article_key(link, art.get("title", ""))
+        title_key = "title:" + _en_normalize_title(art.get("title", ""))
+        basis = rss_lookup.get(key) or rss_lookup.get(title_key)
+        merged.append(basis if basis else {**art, "link": link})
+    return merged
+
+
+def _repair_economynext_checkpoint(json_path: str) -> None:
+    """Rewrite legacy GNews checkpoint URLs to canonical economynext.com links."""
+    import json as _json
+    from datetime import timezone
+
+    from incremental import load_checkpoint_state, normalize_link
+
+    state = load_checkpoint_state(json_path)
+    link = (state.get("last_scraped_link") or "").strip()
+    title = state.get("last_scraped_title") or ""
+    if not link or "news.google.com" not in link:
+        return
+    canonical = _canonical_economynext_link(link, title)
+    if not canonical or canonical == normalize_link(link):
+        return
+    if "economynext.com" not in canonical:
+        return
+    base = os.path.splitext(os.path.basename(json_path))[0]
+    directory = os.path.dirname(json_path) or "."
+    cp_path = os.path.join(directory, f"{base}_checkpoint.json")
+    state["last_scraped_link"] = canonical
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    os.makedirs(directory, exist_ok=True)
+    with open(cp_path, "w", encoding="utf-8") as f:
+        _json.dump(state, f, ensure_ascii=False, indent=2)
+    print(f"[INCREMENTAL] Migrated GNews checkpoint -> {canonical}")
+
+
 def run_economynext_incremental() -> int:
     """Pure RSS approach — no Selenium, no Cloudflare issues from GHA."""
     import re as _re
@@ -142,10 +366,8 @@ def run_economynext_incremental() -> int:
         INCREMENTAL_BOOTSTRAP_LIMIT,
         INCREMENTAL_RUN_LIMIT,
         get_last_scraped_checkpoint,
-        is_last_scraped_article,
-        load_known_links,
-        normalize_link,
         save_replace_only,
+        _load_articles_list,
     )
 
     RSS_FEED = "https://economynext.com/feed/"
@@ -153,12 +375,30 @@ def run_economynext_incremental() -> int:
     GNEWS_RSS = "https://news.google.com/rss/search?q=site:economynext.com&hl=en-US&gl=US&ceid=US:en"
     json_path = data_json_path("economynext_latest_news.json")
 
-    checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
-    bootstrap = not checkpoint_link
+    _repair_economynext_checkpoint(json_path)
+
+    checkpoint_link, checkpoint_title = get_last_scraped_checkpoint(json_path)
+    if checkpoint_link:
+        checkpoint_link = _canonical_economynext_link(
+            checkpoint_link, checkpoint_title or ""
+        )
+    bootstrap = not checkpoint_link and not checkpoint_title
     max_articles = INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
-    known_previous = load_known_links(json_path)
-    if known_previous:
-        print(f"[INCREMENTAL] Skipping {len(known_previous)} URL(s) from previous file")
+
+    known_keys: set[str] = set()
+    for item in _load_articles_list(json_path):
+        if not isinstance(item, dict):
+            continue
+        link = _canonical_economynext_link(
+            item.get("link", ""), item.get("title", "")
+        )
+        known_keys.add(_en_article_key(link, item.get("title", "")))
+    if checkpoint_link or checkpoint_title:
+        known_keys.add(
+            _en_article_key(checkpoint_link or "", checkpoint_title or "")
+        )
+    if known_keys:
+        print(f"[INCREMENTAL] Boundary keys from previous run: {len(known_keys)}")
 
     print("[INCREMENTAL] EconomyNext — RSS/WP-API (no Selenium/Cloudflare)")
     if bootstrap:
@@ -177,68 +417,89 @@ def run_economynext_incremental() -> int:
     }
 
     def _get(url: str, **kw) -> "requests.Response | None":  # type: ignore[name-defined]
+        """curl_cffi first (GHA Cloudflare), then requests."""
+        for profile in ("chrome124", "safari17_0", "firefox133"):
+            try:
+                from curl_cffi import requests as cf_req  # type: ignore
+
+                r = cf_req.get(
+                    url,
+                    impersonate=profile,
+                    timeout=15,
+                    headers=_BROWSER_HEADERS,
+                    **kw,
+                )
+                if r.status_code == 200:
+                    print(f"[INFO] curl_cffi ({profile}) got 200 for {url}")
+                    return r
+                print(f"[WARN] curl_cffi ({profile}) got {r.status_code}")
+            except ImportError:
+                break
+            except Exception as e:
+                print(f"[WARN] curl_cffi ({profile}) failed: {e}")
         import requests as _req
+
         try:
-            r = _req.get(url, timeout=15, allow_redirects=True, headers=_BROWSER_HEADERS, **kw)
+            r = _req.get(
+                url,
+                timeout=15,
+                allow_redirects=True,
+                headers=_BROWSER_HEADERS,
+                **kw,
+            )
             if r.status_code == 200:
                 return r
             print(f"[WARN] requests {r.status_code} for {url}")
         except Exception as e:
             print(f"[WARN] requests failed: {e}")
-        # curl_cffi with multiple profiles
-        for profile in ("chrome124", "safari17_0", "firefox133"):
-            try:
-                from curl_cffi import requests as cf_req  # type: ignore
-                r = cf_req.get(url, impersonate=profile, timeout=15, headers=_BROWSER_HEADERS)
-                if r.status_code == 200:
-                    print(f"[INFO] curl_cffi ({profile}) got 200 for {url}")
-                    return r
-                print(f"[WARN] curl_cffi ({profile}) got {r.status_code}")
-            except Exception as e:
-                print(f"[WARN] curl_cffi ({profile}) failed: {e}")
-                break  # ImportError → no point retrying
         return None
 
-    # --- source 1: RSS feed ---
+    # --- source 1: economynext.com/feed/ (authoritative; retry every TLS profile) ---
     articles_raw: list[dict] = []
-    resp = _get(RSS_FEED)
-    if resp and len(resp.text) > 200:
-        print(f"[INFO] RSS fetched ({len(resp.text)} bytes)")
-        ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
+    rss_basis: list[dict] = []
+    for attempt, profile in enumerate(
+        ("chrome124", "safari17_0", "firefox133", "chrome124"), start=1
+    ):
         try:
-            root = ET.fromstring(resp.text)
-            for item in root.findall(".//item"):
-                link = (item.findtext("link") or "").strip()
-                if not link:
-                    continue
-                title = (item.findtext("title") or "").strip()
-                pub_date = (item.findtext("pubDate") or "").strip()
-                description_html = (item.findtext("description") or "").strip()
-                content_html = (item.findtext("content:encoded", namespaces=ns) or "").strip()
-                date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if pub_date:
-                    try:
-                        from email.utils import parsedate_to_datetime
-                        date_str = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        pass
-                desc_text = ""
-                if description_html:
-                    try:
-                        desc_text = BS(description_html, "html.parser").get_text(separator="\n", strip=True)
-                    except Exception:
-                        desc_text = description_html
-                image_url = ""
-                if content_html:
-                    m = _re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_html)
-                    if m:
-                        image_url = m.group(1)
-                articles_raw.append({"title": title, "link": link, "summary": desc_text,
-                                     "description": desc_text, "date": date_str,
-                                     "image_url": image_url, "date_source": f"RSS: {date_str}"})
-            print(f"[INFO] RSS parsed {len(articles_raw)} items")
-        except ET.ParseError as e:
-            print(f"[WARN] RSS parse error: {e}")
+            from curl_cffi import requests as cf_req  # type: ignore
+
+            resp = cf_req.get(
+                RSS_FEED,
+                impersonate=profile,
+                timeout=20,
+                headers={**_BROWSER_HEADERS, "Accept": "application/rss+xml, application/xml, */*"},
+            )
+            if resp.status_code == 200 and not _is_cloudflare_block(resp.text):
+                rss_basis = _parse_economynext_rss_xml(resp.text)
+                if rss_basis:
+                    articles_raw = rss_basis
+                    print(
+                        f"[INFO] economynext.com/feed/ OK via curl_cffi ({profile}), "
+                        f"{len(articles_raw)} items (attempt {attempt})"
+                    )
+                    break
+                print(f"[WARN] RSS XML empty/invalid from curl_cffi ({profile})")
+            else:
+                print(
+                    f"[WARN] RSS blocked or bad status from curl_cffi ({profile}): "
+                    f"{getattr(resp, 'status_code', '?')}"
+                )
+        except ImportError:
+            break
+        except Exception as e:
+            print(f"[WARN] RSS curl_cffi ({profile}) attempt {attempt}: {e}")
+
+    if not articles_raw:
+        resp = _get(RSS_FEED)
+        if resp and not _is_cloudflare_block(resp.text):
+            rss_basis = _parse_economynext_rss_xml(resp.text)
+            if rss_basis:
+                articles_raw = rss_basis
+                print(f"[INFO] economynext.com/feed/ OK via requests, {len(articles_raw)} items")
+    if articles_raw:
+        rss_basis = list(articles_raw)
+    else:
+        print("[WARN] economynext.com/feed/ unavailable — trying fallbacks")
 
     # --- source 2: WordPress REST API (fallback when RSS blocked) ---
     if not articles_raw:
@@ -280,25 +541,9 @@ def run_economynext_incremental() -> int:
             except Exception as e:
                 print(f"[WARN] WP-API parse error: {e}")
 
-    # --- source 3: Google News RSS (served from Google CDN, never CF-blocked) ---
+    # --- source 3: Google News (discovery only; overlay economynext.com/feed/ when possible) ---
     if not articles_raw:
-        import base64 as _b64
-        print("[INFO] WP-API unavailable — trying Google News RSS...")
-
-        def _decode_gnews_url(gnews_url: str) -> str:
-            """Extract original article URL from a Google News redirect link."""
-            m = _re.search(r"/articles/([^?&#]+)", gnews_url)
-            if not m:
-                return gnews_url
-            try:
-                padded = m.group(1) + "=" * (-len(m.group(1)) % 4)
-                raw = _b64.urlsafe_b64decode(padded)
-                urls = _re.findall(rb"https?://[^\x00-\x1f\x7f-\xff ]+", raw)
-                if urls:
-                    return urls[0].decode("utf-8").rstrip(".")
-            except Exception:
-                pass
-            return gnews_url
+        print("[INFO] WP-API unavailable — trying Google News RSS (discovery only)...")
 
         resp = _get(GNEWS_RSS)
         if resp and len(resp.text) > 200:
@@ -308,11 +553,10 @@ def run_economynext_incremental() -> int:
                     gnews_link = (item.findtext("link") or "").strip()
                     if not gnews_link:
                         continue
-                    link = _decode_gnews_url(gnews_link)
-                    # keep only economynext.com links
+                    title = (item.findtext("title") or "").strip()
+                    link = _canonical_economynext_link(gnews_link, title)
                     if "economynext.com" not in link:
                         link = gnews_link
-                    title = (item.findtext("title") or "").strip()
                     pub_date = (item.findtext("pubDate") or "").strip()
                     desc_html = (item.findtext("description") or "").strip()
                     date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -330,36 +574,65 @@ def run_economynext_incremental() -> int:
             except ET.ParseError as e:
                 print(f"[WARN] Google News RSS parse error: {e}")
 
+        # Last attempt: fetch native RSS again and replace GNews rows with feed data
+        if articles_raw and not rss_basis:
+            resp = _get(RSS_FEED)
+            if resp and not _is_cloudflare_block(resp.text):
+                rss_basis = _parse_economynext_rss_xml(resp.text)
+                if rss_basis:
+                    print(
+                        f"[INFO] economynext.com/feed/ recovered for basis merge "
+                        f"({len(rss_basis)} items)"
+                    )
+        if articles_raw and rss_basis:
+            before = sum(1 for a in articles_raw if a.get("date_source", "").startswith("GNews"))
+            articles_raw = _apply_rss_basis(articles_raw, _en_rss_lookup(rss_basis))
+            after = sum(1 for a in articles_raw if a.get("date_source", "").startswith("RSS"))
+            print(
+                f"[INFO] Merged GNews discovery with economynext.com/feed/ "
+                f"({after} RSS rows, was {before} GNews)"
+            )
+
     if not articles_raw:
         print("[ERROR] All sources failed — saving empty list")
         save_replace_only(json_path, [])
         return 0
 
-    # --- apply checkpoint / dedup / cap ---
+    # Canonical links + newest-first (GNews feed order is not reliable)
+    for art in articles_raw:
+        raw_link = art.get("link", "")
+        art["link"] = _canonical_economynext_link(raw_link, art.get("title", ""))
+        if "news.google.com" in raw_link and "economynext.com" in art["link"]:
+            ds = art.get("date_source", "")
+            if ds.startswith("GNews:"):
+                art["date_source"] = ds.replace("GNews:", "GNews-EN:", 1)
+    articles_raw.sort(key=lambda a: a.get("date", ""), reverse=True)
+
+    # --- apply checkpoint / dedup / cap (newest-first: stop at boundary, don't skip) ---
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
 
     for art in articles_raw:
-        link = art["link"]
-        norm = normalize_link(link)
-
-        if is_last_scraped_article(link, checkpoint_link):
-            print(f"[INCREMENTAL] Reached last scraped article — stopping.\n             {link}")
+        stop = _en_boundary_stop_reason(
+            art, checkpoint_link, checkpoint_title, known_keys
+        )
+        if stop:
+            print(
+                f"[INCREMENTAL] Reached boundary ({stop}) — stopping.\n"
+                f"             {art.get('title', '')[:70]}"
+            )
             break
 
-        if norm in known_previous:
-            print(f"[SKIP] Already in previous run: {link[:80]}")
-            continue
-
-        if norm in seen_this_run:
+        key = _en_article_key(art.get("link", ""), art.get("title", ""))
+        if key in seen_this_run:
             continue
 
         if not art.get("title") and not art.get("summary"):
-            print(f"[SKIP] Empty row: {link[:80]}")
+            print(f"[SKIP] Empty row: {art.get('link', '')[:80]}")
             continue
 
         new_articles.append(art)
-        seen_this_run.add(norm)
+        seen_this_run.add(key)
         print(f"[INFO] +Article: {art['title'][:70]}")
 
         if len(new_articles) >= max_articles:
