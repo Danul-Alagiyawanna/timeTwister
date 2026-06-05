@@ -14,11 +14,9 @@ from urllib.parse import urljoin, urlparse
 import os
 
 from incremental import (
-    filter_cross_section_promo_links,
     get_section_checkpoint,
     incremental_fetch_limit,
     is_incremental_mode,
-    load_checkpoint_state,
     load_known_links,
     normalize_link,
     reached_section_incremental_limit,
@@ -176,97 +174,31 @@ def is_article_in_date_range(article_date, start_date, end_date):
 
 
 def _link_in_chrome(tag) -> bool:
-    """Skip header/footer/nav/ticker so list order matches the category feed."""
+    """Skip header/footer/nav so list order matches the category feed."""
     for parent in tag.parents:
         if parent.name in ("header", "footer", "nav"):
             return True
         classes = parent.get("class") or []
-        class_str = " ".join(classes).lower()
         if any(
-            marker in class_str
-            for marker in (
+            c in classes
+            for c in (
                 "header",
                 "footer",
                 "navbar",
                 "nav-",
-                "ticker",
-                "marquee",
-                "breaking",
-                "headline",
-                "announcement",
-                "top-story",
-                "swiper",
             )
         ):
             return True
+        class_str = " ".join(classes)
+        if "header" in class_str or "footer" in class_str:
+            return True
     return False
-
-
-def _category_listing_root(soup: BeautifulSoup):
-    """Main category grid — below the page h1, not the site-wide headline ticker."""
-    main = soup.select_one("main") or soup.body
-    h1 = main.select_one("h1")
-    if not h1:
-        return main
-    node = h1
-    best = main
-    best_count = 0
-    for _ in range(8):
-        parent = node.parent
-        if not parent or parent.name == "html":
-            break
-        count = sum(
-            1
-            for a in parent.find_all("a", href=True)
-            if (a.get("href") or "").startswith("/articles/")
-        )
-        if count > best_count:
-            best = parent
-            best_count = count
-        node = parent
-    return best
-
-
-def _cross_section_promo_norms(
-    section_links: dict[str, list[str]],
-    *,
-    window: int = 12,
-    min_sections: int = 2,
-) -> set[str]:
-    from collections import Counter
-
-    counts: Counter[str] = Counter()
-    for links in section_links.values():
-        seen: set[str] = set()
-        for link in links[:window]:
-            norm = normalize_link(link)
-            if norm and norm not in seen:
-                counts[norm] += 1
-                seen.add(norm)
-    return {url for url, n in counts.items() if n >= min_sections}
-
-
-def _shared_section_checkpoint_norms(
-    json_filename: str,
-    section_keys: list[str],
-) -> set[str]:
-    """Same URL stored as checkpoint in multiple sections (legacy migrate bleed)."""
-    from collections import Counter
-
-    sections = load_checkpoint_state(json_filename).get("sections") or {}
-    counts: Counter[str] = Counter()
-    for key in section_keys:
-        entry = sections.get(key) or {}
-        link = entry.get("last_scraped_link") or ""
-        if link:
-            counts[normalize_link(link)] += 1
-    return {url for url, n in counts.items() if n >= 2}
 
 
 def get_main_article_links(driver, preserve_order=False):
     """Category article URLs in DOM order (newest first on the live page)."""
     soup = BeautifulSoup(driver.page_source, "html.parser")
-    root = _category_listing_root(soup)
+    root = soup.select_one("main") or soup.body
     ordered: list[str] = []
     seen: set[str] = set()
     for a in root.find_all("a", href=True):
@@ -450,16 +382,6 @@ def main_incremental() -> int:
             print(f"  [ERROR] {e}")
             section_links[name] = []
 
-    promo_norms = _cross_section_promo_norms(section_links)
-    stale_ckpt_norms = _shared_section_checkpoint_norms(json_filename, section_keys)
-    bad_boundary_norms = promo_norms | stale_ckpt_norms
-    if bad_boundary_norms:
-        print(
-            f"[INCREMENTAL] Ignoring {len(bad_boundary_norms)} shared/promo "
-            f"checkpoint URL(s)"
-        )
-    section_links = filter_cross_section_promo_links(section_links)
-
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
     section_checkpoint_updates: dict[str, tuple[str, str]] = {}
@@ -468,20 +390,12 @@ def main_incremental() -> int:
         section_new = 0
         links = section_links.get(name, [])
         sec_ckpt, sec_ckpt_title = get_section_checkpoint(json_filename, name)
-        effective_ckpt = sec_ckpt
-        if sec_ckpt and normalize_link(sec_ckpt) in bad_boundary_norms:
-            effective_ckpt = None
-            print(
-                f"\n[PHASE 2] {name} - ignoring stale/promo checkpoint "
-                f"{sec_ckpt.split('/')[-1]}"
-            )
-        else:
-            print(f"\n[PHASE 2] {name} - checkpoint: {(sec_ckpt or 'None')[:70]}")
+        print(f"\n[PHASE 2] {name} - checkpoint: {(sec_ckpt or 'None')[:70]}")
         stopped_at: str | None = None
 
         for i, link in enumerate(links, 1):
             norm = normalize_link(link)
-            if effective_ckpt and normalize_link(effective_ckpt) == norm:
+            if sec_ckpt and normalize_link(sec_ckpt) == norm:
                 print("  [STOP] Reached section checkpoint")
                 stopped_at = link
                 break
@@ -557,7 +471,7 @@ def main_incremental() -> int:
                 head,
                 title_for_checkpoint_link(head, new_articles, json_filename),
             )
-        elif sec_ckpt and normalize_link(sec_ckpt) not in bad_boundary_norms:
+        elif sec_ckpt:
             section_checkpoint_updates[name] = (
                 sec_ckpt,
                 title_for_checkpoint_link(
