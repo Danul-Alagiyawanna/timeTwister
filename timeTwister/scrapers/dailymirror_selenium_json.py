@@ -838,6 +838,59 @@ def _article_id_from_dailymirror_link(link: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _dailymirror_story_key(link: str) -> str:
+    """Stable id across breaking-news vs latest-news path variants."""
+    aid = _article_id_from_dailymirror_link(link)
+    if aid:
+        return f"108-{aid}"
+    return _normalize_article_link(link)
+
+
+def _dailymirror_boundary_keys(json_path: str) -> tuple[str | None, set[str]]:
+    """Checkpoint story key plus keys from the replace-only delta file."""
+    from incremental import _load_articles_list, get_last_scraped_checkpoint
+
+    checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
+    checkpoint_key = (
+        _dailymirror_story_key(checkpoint_link) if checkpoint_link else None
+    )
+    known: set[str] = set()
+    for item in _load_articles_list(json_path):
+        if isinstance(item, dict) and item.get("link"):
+            known.add(_dailymirror_story_key(item["link"]))
+    if checkpoint_key:
+        known.add(checkpoint_key)
+    return checkpoint_key, known
+
+
+def _dailymirror_stop_reason(
+    link: str,
+    *,
+    checkpoint_key: str | None,
+    known_keys: set[str],
+) -> str | None:
+    """
+    Newest-first list: stop at checkpoint story id or anything older than it.
+    URL paths differ (breaking-news vs latest-news) but story ids match.
+    """
+    key = _dailymirror_story_key(link)
+    link_id = _article_id_from_dailymirror_link(link)
+    cp_id = 0
+    if checkpoint_key and checkpoint_key.startswith("108-"):
+        try:
+            cp_id = int(checkpoint_key.split("-", 1)[1])
+        except ValueError:
+            cp_id = 0
+
+    if checkpoint_key and key == checkpoint_key:
+        return "checkpoint"
+    if cp_id and link_id and link_id < cp_id:
+        return "known_previous"
+    if key in known_keys:
+        return "known_previous"
+    return None
+
+
 def _order_links_newest_first(links: list[str]) -> list[str]:
     """Ensure newest-first for incremental stop/checkpoint (detect DOM order)."""
     if len(links) < 2:
@@ -1074,30 +1127,99 @@ def fetch_article_incremental(driver, link: str) -> dict | None:
 
 
 def main_incremental():
-    """Incremental on GHA: same driver + extract_article_content + archive merge as local main()."""
+    """Incremental on page 1 only; boundaries use story id (108-NNNNN), not URL path."""
     import os
 
-    scraper_dir = os.path.dirname(os.path.abspath(__file__))
-    if scraper_dir not in sys.path:
-        sys.path.insert(0, scraper_dir)
-    from incremental_runner import run_incremental_scraper
-
-    # One list page only — stop at checkpoint; page 2 caused re-scraping past the boundary
-    pages = [("latest", BASE_URL)]
-
-    return run_incremental_scraper(
-        outlet_name="Daily Mirror",
-        data_filename="dailymirror_latest_news.json",
-        pages=pages,
-        collect_links=collect_list_page_links,
-        fetch_article=fetch_article_incremental,
-        create_driver=create_driver,
-        use_undetected=False,
-        save_mode="replace",
-        sleep_between_articles=1.0,
-        sleep_after_list_page=2.0,
-        before_save=sort_dailymirror_articles_newest_first,
+    from incremental import (
+        INCREMENTAL_BOOTSTRAP_LIMIT,
+        INCREMENTAL_RUN_LIMIT,
     )
+    from incremental_runner import data_json_path, save_replace_only
+
+    json_path = data_json_path("dailymirror_latest_news.json")
+    checkpoint_key, known_keys = _dailymirror_boundary_keys(json_path)
+    bootstrap = not checkpoint_key
+    max_articles = (
+        INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
+    )
+
+    if known_keys:
+        print(
+            f"[INCREMENTAL] Boundary set: {len(known_keys)} story id(s) "
+            "(archive + checkpoint)"
+        )
+    print("[INCREMENTAL] Daily Mirror - stop by story id (108-NNNNN)")
+    if bootstrap:
+        print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
+    else:
+        print(
+            f"[INCREMENTAL] Checkpoint story {checkpoint_key}; "
+            f"run safety cap {max_articles}"
+        )
+
+    driver = create_driver()
+    new_articles: list[dict] = []
+    seen_this_run: set[str] = set()
+
+    try:
+        print(f"\n{'=' * 50}\n[INCREMENTAL] Daily Mirror / latest\n{BASE_URL}")
+        links = collect_list_page_links(driver, BASE_URL)
+        print(f"[INFO] {len(links)} links on list page")
+
+        for i, link in enumerate(links, 1):
+            story_key = _dailymirror_story_key(link)
+            stop = _dailymirror_stop_reason(
+                link,
+                checkpoint_key=checkpoint_key,
+                known_keys=known_keys,
+            )
+            if stop:
+                print(f"\n[INCREMENTAL] Reached boundary ({stop}) - stopping.")
+                print(f"             {link} ({story_key})")
+                break
+
+            if story_key in seen_this_run:
+                continue
+
+            print(f"\n[INFO] New {i}: {link[:80]}... ({story_key})")
+            try:
+                row = fetch_article_incremental(driver, link)
+                if row:
+                    title = (row.get("title") or "").strip()
+                    summary = (
+                        (row.get("summary") or row.get("description") or "")
+                    ).strip()
+                    if not title and not summary:
+                        print(f"[SKIP] Empty row (no title/body): {link[:80]}...")
+                        continue
+                    new_articles.append(row)
+                    seen_this_run.add(story_key)
+            except Exception as e:
+                print(f"[ERROR] Article failed: {e}")
+
+            if len(new_articles) >= max_articles:
+                label = "Bootstrap" if bootstrap else "Run safety"
+                print(
+                    f"[INCREMENTAL] {label} limit ({max_articles}) reached."
+                )
+                break
+
+            time.sleep(1.0)
+    finally:
+        driver.quit()
+
+    new_articles = [
+        a
+        for a in new_articles
+        if (a.get("title") or "").strip()
+        or (a.get("summary") or a.get("description") or "").strip()
+    ]
+    if new_articles:
+        new_articles = sort_dailymirror_articles_newest_first(new_articles)
+    print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
+    save_replace_only(json_path, new_articles)
+    print("[INCREMENTAL] Daily Mirror finished.")
+    return len(new_articles)
 
 
 def main(start_date=None, end_date=None):
