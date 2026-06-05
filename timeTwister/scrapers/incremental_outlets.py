@@ -296,36 +296,6 @@ def _parse_economynext_rss_xml(
     return articles
 
 
-def _en_rss_lookup(articles: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Index RSS rows by canonical URL and normalized title."""
-    by_key: dict[str, dict[str, Any]] = {}
-    for art in articles:
-        link = _canonical_economynext_link(art.get("link", ""), art.get("title", ""))
-        art = {**art, "link": link}
-        by_key[_en_article_key(link, art.get("title", ""))] = art
-        title_key = _en_normalize_title(art.get("title", ""))
-        if title_key:
-            by_key.setdefault("title:" + title_key, art)
-    return by_key
-
-
-def _apply_rss_basis(
-    articles: list[dict[str, Any]],
-    rss_lookup: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Replace fallback-source rows with economynext.com/feed/ data when matched."""
-    if not rss_lookup:
-        return articles
-    merged: list[dict[str, Any]] = []
-    for art in articles:
-        link = _canonical_economynext_link(art.get("link", ""), art.get("title", ""))
-        key = _en_article_key(link, art.get("title", ""))
-        title_key = "title:" + _en_normalize_title(art.get("title", ""))
-        basis = rss_lookup.get(key) or rss_lookup.get(title_key)
-        merged.append(basis if basis else {**art, "link": link})
-    return merged
-
-
 def _repair_economynext_checkpoint(json_path: str) -> None:
     """Rewrite legacy GNews checkpoint URLs to canonical economynext.com links."""
     import json as _json
@@ -355,10 +325,8 @@ def _repair_economynext_checkpoint(json_path: str) -> None:
 
 
 def run_economynext_incremental() -> int:
-    """Pure RSS approach — no Selenium, no Cloudflare issues from GHA."""
+    """economynext.com/feed/ (+ WP API fallback). No Google News — links only, no article body."""
     import re as _re
-    import xml.etree.ElementTree as ET
-    from email.utils import parsedate_to_datetime
 
     from bs4 import BeautifulSoup as BS
 
@@ -372,7 +340,6 @@ def run_economynext_incremental() -> int:
 
     RSS_FEED = "https://economynext.com/feed/"
     WP_API = "https://economynext.com/wp-json/wp/v2/posts"
-    GNEWS_RSS = "https://news.google.com/rss/search?q=site:economynext.com&hl=en-US&gl=US&ceid=US:en"
     json_path = data_json_path("economynext_latest_news.json")
 
     _repair_economynext_checkpoint(json_path)
@@ -400,7 +367,7 @@ def run_economynext_incremental() -> int:
     if known_keys:
         print(f"[INCREMENTAL] Boundary keys from previous run: {len(known_keys)}")
 
-    print("[INCREMENTAL] EconomyNext — RSS/WP-API (no Selenium/Cloudflare)")
+    print("[INCREMENTAL] EconomyNext - economynext.com/feed/ (+ WP API fallback)")
     if bootstrap:
         print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
     else:
@@ -456,7 +423,6 @@ def run_economynext_incremental() -> int:
 
     # --- source 1: economynext.com/feed/ (authoritative; retry every TLS profile) ---
     articles_raw: list[dict] = []
-    rss_basis: list[dict] = []
     for attempt, profile in enumerate(
         ("chrome124", "safari17_0", "firefox133", "chrome124"), start=1
     ):
@@ -470,9 +436,9 @@ def run_economynext_incremental() -> int:
                 headers={**_BROWSER_HEADERS, "Accept": "application/rss+xml, application/xml, */*"},
             )
             if resp.status_code == 200 and not _is_cloudflare_block(resp.text):
-                rss_basis = _parse_economynext_rss_xml(resp.text)
-                if rss_basis:
-                    articles_raw = rss_basis
+                parsed = _parse_economynext_rss_xml(resp.text)
+                if parsed:
+                    articles_raw = parsed
                     print(
                         f"[INFO] economynext.com/feed/ OK via curl_cffi ({profile}), "
                         f"{len(articles_raw)} items (attempt {attempt})"
@@ -492,14 +458,12 @@ def run_economynext_incremental() -> int:
     if not articles_raw:
         resp = _get(RSS_FEED)
         if resp and not _is_cloudflare_block(resp.text):
-            rss_basis = _parse_economynext_rss_xml(resp.text)
-            if rss_basis:
-                articles_raw = rss_basis
+            parsed = _parse_economynext_rss_xml(resp.text)
+            if parsed:
+                articles_raw = parsed
                 print(f"[INFO] economynext.com/feed/ OK via requests, {len(articles_raw)} items")
-    if articles_raw:
-        rss_basis = list(articles_raw)
-    else:
-        print("[WARN] economynext.com/feed/ unavailable — trying fallbacks")
+    if not articles_raw:
+        print("[WARN] economynext.com/feed/ unavailable - trying WP API fallback")
 
     # --- source 2: WordPress REST API (fallback when RSS blocked) ---
     if not articles_raw:
@@ -541,71 +505,15 @@ def run_economynext_incremental() -> int:
             except Exception as e:
                 print(f"[WARN] WP-API parse error: {e}")
 
-    # --- source 3: Google News (discovery only; overlay economynext.com/feed/ when possible) ---
     if not articles_raw:
-        print("[INFO] WP-API unavailable — trying Google News RSS (discovery only)...")
-
-        resp = _get(GNEWS_RSS)
-        if resp and len(resp.text) > 200:
-            try:
-                root = ET.fromstring(resp.text)
-                for item in root.findall(".//item"):
-                    gnews_link = (item.findtext("link") or "").strip()
-                    if not gnews_link:
-                        continue
-                    title = (item.findtext("title") or "").strip()
-                    link = _canonical_economynext_link(gnews_link, title)
-                    if "economynext.com" not in link:
-                        link = gnews_link
-                    pub_date = (item.findtext("pubDate") or "").strip()
-                    desc_html = (item.findtext("description") or "").strip()
-                    date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    if pub_date:
-                        try:
-                            from email.utils import parsedate_to_datetime as _p2d
-                            date_str = _p2d(pub_date).strftime("%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            pass
-                    desc_text = BS(desc_html, "html.parser").get_text(separator="\n", strip=True) if desc_html else ""
-                    articles_raw.append({"title": title, "link": link, "summary": desc_text,
-                                         "description": desc_text, "date": date_str,
-                                         "image_url": "", "date_source": f"GNews: {date_str}"})
-                print(f"[INFO] Google News RSS returned {len(articles_raw)} items")
-            except ET.ParseError as e:
-                print(f"[WARN] Google News RSS parse error: {e}")
-
-        # Last attempt: fetch native RSS again and replace GNews rows with feed data
-        if articles_raw and not rss_basis:
-            resp = _get(RSS_FEED)
-            if resp and not _is_cloudflare_block(resp.text):
-                rss_basis = _parse_economynext_rss_xml(resp.text)
-                if rss_basis:
-                    print(
-                        f"[INFO] economynext.com/feed/ recovered for basis merge "
-                        f"({len(rss_basis)} items)"
-                    )
-        if articles_raw and rss_basis:
-            before = sum(1 for a in articles_raw if a.get("date_source", "").startswith("GNews"))
-            articles_raw = _apply_rss_basis(articles_raw, _en_rss_lookup(rss_basis))
-            after = sum(1 for a in articles_raw if a.get("date_source", "").startswith("RSS"))
-            print(
-                f"[INFO] Merged GNews discovery with economynext.com/feed/ "
-                f"({after} RSS rows, was {before} GNews)"
-            )
-
-    if not articles_raw:
-        print("[ERROR] All sources failed — saving empty list")
+        print("[ERROR] economynext.com/feed/ and WP API failed - saving empty list")
         save_replace_only(json_path, [])
         return 0
 
-    # Canonical links + newest-first (GNews feed order is not reliable)
     for art in articles_raw:
-        raw_link = art.get("link", "")
-        art["link"] = _canonical_economynext_link(raw_link, art.get("title", ""))
-        if "news.google.com" in raw_link and "economynext.com" in art["link"]:
-            ds = art.get("date_source", "")
-            if ds.startswith("GNews:"):
-                art["date_source"] = ds.replace("GNews:", "GNews-EN:", 1)
+        art["link"] = _canonical_economynext_link(
+            art.get("link", ""), art.get("title", "")
+        )
     articles_raw.sort(key=lambda a: a.get("date", ""), reverse=True)
 
     # --- apply checkpoint / dedup / cap (newest-first: stop at boundary, don't skip) ---
@@ -618,7 +526,7 @@ def run_economynext_incremental() -> int:
         )
         if stop:
             print(
-                f"[INCREMENTAL] Reached boundary ({stop}) — stopping.\n"
+                f"[INCREMENTAL] Reached boundary ({stop}) - stopping.\n"
                 f"             {art.get('title', '')[:70]}"
             )
             break
