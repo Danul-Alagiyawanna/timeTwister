@@ -415,6 +415,14 @@ def sync_global_checkpoint_from_sections(articles_json_path: str) -> bool:
             best_title = entry.get("last_scraped_title") or ""
 
     if not best_link:
+        for preferred in ("latest_news", "news", "local", "top-story"):
+            entry = sections.get(preferred)
+            if isinstance(entry, dict) and entry.get("last_scraped_link"):
+                best_link = entry["last_scraped_link"]
+                best_title = entry.get("last_scraped_title") or ""
+                break
+
+    if not best_link:
         return False
 
     update_section_checkpoints(

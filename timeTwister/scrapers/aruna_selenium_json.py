@@ -23,6 +23,8 @@ from incremental import (
     save_replace_only,
     apply_section_head_checkpoints,
     migrate_global_checkpoint_to_sections,
+    sync_global_checkpoint_from_sections,
+    title_for_checkpoint_link,
 )
 
 ARUNA_CATEGORIES = [
@@ -171,23 +173,45 @@ def is_article_in_date_range(article_date, start_date, end_date):
 
 
 
+def _link_in_chrome(tag) -> bool:
+    """Skip header/footer/nav so list order matches the category feed."""
+    for parent in tag.parents:
+        if parent.name in ("header", "footer", "nav"):
+            return True
+        classes = parent.get("class") or []
+        if any(
+            c in classes
+            for c in (
+                "header",
+                "footer",
+                "navbar",
+                "nav-",
+            )
+        ):
+            return True
+        class_str = " ".join(classes)
+        if "header" in class_str or "footer" in class_str:
+            return True
+    return False
+
+
 def get_main_article_links(driver, preserve_order=False):
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    # Find all main news grid containers
-    main_grids = soup.find_all('div', class_=['grid', 'grid-cols-8', 'gap-4', 'mb-10'])
-    ordered = []
-    seen = set()
-    for grid in main_grids:
-        for a in grid.find_all('a', href=True):
-            href = a['href']
-            if href.startswith('/articles/'):
-                full = 'https://www.aruna.lk' + href
-                if preserve_order:
-                    if full not in seen:
-                        seen.add(full)
-                        ordered.append(full)
-                else:
-                    seen.add(full)
+    """Category article URLs in DOM order (newest first on the live page)."""
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    root = soup.select_one("main") or soup.body
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for a in root.find_all("a", href=True):
+        if _link_in_chrome(a):
+            continue
+        href = (a["href"] or "").strip()
+        if not href.startswith("/articles/"):
+            continue
+        full = "https://www.aruna.lk" + href.split("?")[0]
+        if full in seen:
+            continue
+        seen.add(full)
+        ordered.append(full)
     if preserve_order:
         return ordered
     return list(seen)
@@ -340,30 +364,44 @@ def main_incremental() -> int:
         print(f"\n[PHASE 1] {name}: {url}")
         try:
             driver.get(url)
-            time.sleep(3)
+            try:
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, 'a[href^="/articles/"]')
+                    )
+                )
+            except Exception:
+                time.sleep(3)
             links = get_main_article_links(driver, preserve_order=True)
             section_links[name] = links
-            print(f"  {len(links)} links")
+            if links:
+                print(f"  {len(links)} links (head: {links[0].split('/')[-1]})")
+            else:
+                print("  0 links")
         except Exception as e:
             print(f"  [ERROR] {e}")
             section_links[name] = []
 
     new_articles: list[dict] = []
     seen_this_run: set[str] = set()
+    section_checkpoint_updates: dict[str, tuple[str, str]] = {}
 
     for name, _url in ARUNA_CATEGORIES:
         section_new = 0
         links = section_links.get(name, [])
-        sec_ckpt, _ = get_section_checkpoint(json_filename, name)
-        print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
+        sec_ckpt, sec_ckpt_title = get_section_checkpoint(json_filename, name)
+        print(f"\n[PHASE 2] {name} - checkpoint: {(sec_ckpt or 'None')[:70]}")
+        stopped_at: str | None = None
 
         for i, link in enumerate(links, 1):
             norm = normalize_link(link)
             if sec_ckpt and normalize_link(sec_ckpt) == norm:
                 print("  [STOP] Reached section checkpoint")
+                stopped_at = link
                 break
             if norm in known_previous:
                 print(f"  [STOP] Already in previous run: {link[:70]}")
+                stopped_at = link
                 break
             if norm in seen_this_run:
                 continue
@@ -410,18 +448,55 @@ def main_incremental() -> int:
                 label = "Bootstrap" if bootstrap else "Run safety"
                 print(
                     f"[INCREMENTAL] {label} limit ({max_per_section}) "
-                    f"for section {name} — next section"
+                    f"for section {name} - next section"
                 )
                 break
 
             time.sleep(0.5)
+
+        if stopped_at:
+            section_checkpoint_updates[name] = (
+                stopped_at,
+                title_for_checkpoint_link(
+                    stopped_at,
+                    new_articles,
+                    json_filename,
+                    section_checkpoint_link=sec_ckpt,
+                    section_checkpoint_title=sec_ckpt_title,
+                ),
+            )
+        elif section_new > 0 and links:
+            head = links[0]
+            section_checkpoint_updates[name] = (
+                head,
+                title_for_checkpoint_link(head, new_articles, json_filename),
+            )
+        elif sec_ckpt:
+            section_checkpoint_updates[name] = (
+                sec_ckpt,
+                title_for_checkpoint_link(
+                    sec_ckpt,
+                    new_articles,
+                    json_filename,
+                    section_checkpoint_link=sec_ckpt,
+                    section_checkpoint_title=sec_ckpt_title,
+                ),
+            )
+        elif links:
+            head = links[0]
+            section_checkpoint_updates[name] = (
+                head,
+                title_for_checkpoint_link(head, new_articles, json_filename),
+            )
 
     apply_section_head_checkpoints(
         json_filename,
         section_links,
         new_articles,
         section_keys=section_keys,
+        section_updates=section_checkpoint_updates,
     )
+    sync_global_checkpoint_from_sections(json_filename)
 
     try:
         driver.quit()
