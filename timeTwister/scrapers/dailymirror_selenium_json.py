@@ -33,8 +33,9 @@ from urllib.parse import urljoin
 BASE_URL = "https://www.dailymirror.lk/latest-news/108"
 _ARTICLE_HREF_RE = re.compile(r"/108-\d+/?")
 
-# List-page metadata keyed by normalized URL (used when article page extract fails on CI)
+# List-page metadata (used when article page extract fails on CI)
 _LIST_PAGE_HINTS: dict[str, dict] = {}
+_LIST_PAGE_HINTS_BY_ID: dict[int, dict] = {}
 
 
 class TimeoutError(Exception):
@@ -67,6 +68,43 @@ def extract_with_timeout(driver, timeout_seconds=30):
         # Re-raise if it's a real error and didn't timeout
         raise
 
+def _page_is_cloudflare(driver) -> bool:
+    title = (driver.title or "").strip().lower()
+    src = (driver.page_source or "").lower()
+    return (
+        "just a moment" in title
+        or "checking your browser" in src
+        or "cf-browser-verification" in src
+        or "challenge-platform" in src
+    )
+
+
+def _store_list_hint(href: str, hint: dict) -> None:
+    """Index list metadata by URL and story id (107- vs 108- paths differ)."""
+    norm = _normalize_article_link(href)
+    if norm:
+        existing = _LIST_PAGE_HINTS.get(norm, {})
+        if len(hint.get("list_description") or "") >= len(
+            existing.get("list_description") or ""
+        ):
+            _LIST_PAGE_HINTS[norm] = {**existing, **hint}
+    aid = _article_id_from_dailymirror_link(href)
+    if aid:
+        existing = _LIST_PAGE_HINTS_BY_ID.get(aid, {})
+        if len(hint.get("list_description") or "") >= len(
+            existing.get("list_description") or ""
+        ):
+            _LIST_PAGE_HINTS_BY_ID[aid] = {**existing, **hint}
+
+
+def _list_hint_for_link(link: str) -> dict:
+    hint = _LIST_PAGE_HINTS.get(_normalize_article_link(link), {})
+    if hint:
+        return hint
+    aid = _article_id_from_dailymirror_link(link)
+    return _LIST_PAGE_HINTS_BY_ID.get(aid, {}) if aid else {}
+
+
 def extract_article_content(driver, max_elapsed_time=30):
     """Extract detailed content from article page using XPath."""
     start_time = time.time()
@@ -74,6 +112,16 @@ def extract_article_content(driver, max_elapsed_time=30):
     try:
         print(f"     [EXTRACT] Current URL: {driver.current_url}")
         print(f"     [EXTRACT] Page title: {driver.title}")
+
+        if _page_is_cloudflare(driver):
+            print("     [EXTRACT] Cloudflare challenge — skipping article extract")
+            return {
+                "date_published": None,
+                "image_url": "",
+                "description": "",
+                "title": "",
+                "link": driver.current_url,
+            }
         
         # Check elapsed time
         if time.time() - start_time > max_elapsed_time:
@@ -818,15 +866,34 @@ def _wait_for_list_articles(driver, *, timeout: int = 40) -> bool:
 
 
 def _maybe_wait_cloudflare(driver) -> bool:
-    page_source_lower = (driver.page_source or "").lower()
-    if not any(
-        m in page_source_lower
-        for m in ("cloudflare", "challenge", "checking your browser")
-    ):
+    if not _page_is_cloudflare(driver):
         return False
     print("[WARNING] Cloudflare challenge — waiting longer...")
     time.sleep(15)
     return True
+
+
+def _wait_for_article_page(driver, *, timeout: int = 45) -> bool:
+    """Wait until Cloudflare clears and article shell is present."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _page_is_cloudflare(driver):
+            _maybe_wait_cloudflare(driver)
+            time.sleep(3)
+            continue
+        try:
+            if driver.find_elements(
+                By.CSS_SELECTOR,
+                "div.a-content, meta[itemprop='datePublished'], meta[property='og:title']",
+            ):
+                return True
+        except Exception:
+            pass
+        title = (driver.title or "").strip().lower()
+        if title and "just a moment" not in title and "dailymirror" in title:
+            return True
+        time.sleep(2)
+    return not _page_is_cloudflare(driver)
 
 
 def _prepare_list_page(driver, list_url: str) -> bool:
@@ -917,12 +984,15 @@ def _collect_links_xpath(driver) -> list[str]:
             except Exception:
                 image_url = ""
             links.append(href)
-            _LIST_PAGE_HINTS[_normalize_article_link(href)] = {
-                "title": title,
-                "list_description": description,
-                "list_image": image_url,
-                "date_text": date_text,
-            }
+            _store_list_hint(
+                href,
+                {
+                    "title": title,
+                    "list_description": description,
+                    "list_image": image_url,
+                    "date_text": date_text,
+                },
+            )
         except Exception:
             break
     return links
@@ -949,8 +1019,16 @@ def _collect_links_fallback(driver) -> list[str]:
         seen.add(norm)
         links.append(full)
         title = h3.get_text(strip=True)
-        if title and norm not in _LIST_PAGE_HINTS:
-            _LIST_PAGE_HINTS[norm] = {"title": title, "list_description": "", "list_image": "", "date_text": ""}
+        if title:
+            _store_list_hint(
+                full,
+                {
+                    "title": title,
+                    "list_description": "",
+                    "list_image": "",
+                    "date_text": "",
+                },
+            )
 
     if links:
         print(f"[INFO] Fallback HTML parse: {len(links)} article link(s)")
@@ -1058,8 +1136,9 @@ def collect_list_page_links(driver, list_url: str) -> tuple[list[str], bool]:
     Ordered article URLs from one list page.
     Returns (links, list_page_ok). list_page_ok=False on navigation failure — do not wipe JSON.
     """
-    global _LIST_PAGE_HINTS
+    global _LIST_PAGE_HINTS, _LIST_PAGE_HINTS_BY_ID
     _LIST_PAGE_HINTS = {}
+    _LIST_PAGE_HINTS_BY_ID = {}
     if not _prepare_list_page(driver, list_url):
         print("[ERROR] Could not load Daily Mirror list page")
         return [], False
@@ -1225,21 +1304,33 @@ def article_row_from_extract(
 def fetch_article_incremental(driver, link: str) -> dict | None:
     import os
 
-    hint = _LIST_PAGE_HINTS.get(_normalize_article_link(link), {})
+    is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
+    hint = _list_hint_for_link(link)
+    cf_timeout = 60 if is_ci else 35
+
     for attempt in range(2):
         try:
             driver.get(link)
-            time.sleep(5 if os.getenv("CI") else 2)
-            meta = extract_with_timeout(driver, timeout_seconds=60)
-            row = article_row_from_extract(meta, link, hint)
-            if row and (row.get("summary") or "").strip():
-                return row
-            if row and attempt == 1:
-                return row
+            if not _wait_for_article_page(driver, timeout=cf_timeout):
+                print(
+                    f"[WARN] Article still behind Cloudflare after {cf_timeout}s: "
+                    f"{link[:80]}..."
+                )
+            else:
+                meta = extract_with_timeout(driver, timeout_seconds=60)
+                row = article_row_from_extract(meta, link, hint)
+                if row and (row.get("summary") or "").strip():
+                    return row
+                if row and attempt == 1:
+                    return row
         except Exception as e:
             print(f"[ERROR] fetch attempt {attempt + 1}: {e}")
-        time.sleep(2)
-    return article_row_from_extract(None, link, hint)
+        time.sleep(3)
+
+    row = article_row_from_extract(None, link, hint)
+    if row and hint:
+        print(f"[INFO] List-page fallback for id {_article_id_from_dailymirror_link(link)}")
+    return row
 
 
 def main_incremental():

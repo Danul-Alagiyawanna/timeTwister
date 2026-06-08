@@ -218,22 +218,50 @@ def collect_ceylontoday_links(driver: Any, url: str) -> list[str]:
     return links
 
 
+_VIRAKESARI_ARTICLE_ID_RE = re.compile(r"/article/(\d+)")
+
+
+def virakesari_article_id(link: str) -> int:
+    m = _VIRAKESARI_ARTICLE_ID_RE.search(link or "")
+    return int(m.group(1)) if m else 0
+
+
 def collect_virakesari_links(driver: Any, url: str) -> list[str]:
     sep = "&" if "?" in url else "?"
     page_url = url if "page=" in url else f"{url}{sep}page=1"
     _navigate(driver, page_url, 5)
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "a.news-item"))
+        )
+    except Exception:
+        pass
+    try:
+        driver.execute_script(
+            "document.querySelectorAll('.modal.show,#randomPopup').forEach("
+            "el => el.remove());"
+            "document.body.classList.remove('modal-open');"
+        )
+    except Exception:
+        pass
     soup = BeautifulSoup(driver.page_source, "html.parser")
     links: list[str] = []
-    seen: set[str] = set()
+    seen_ids: set[int] = set()
     for card in soup.find_all("a", class_="news-item"):
         href = (card.get("href") or "").strip()
         if not href:
             continue
         if not href.startswith("http"):
             href = "https://www.virakesari.lk" + href
-        if href not in seen:
-            seen.add(href)
-            links.append(href)
+        aid = virakesari_article_id(href)
+        if not aid or aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        links.append(href.split("?")[0])
+    links.sort(key=virakesari_article_id, reverse=True)
+    if links:
+        ids = [virakesari_article_id(u) for u in links[:3]]
+        print(f"[INFO] Virakesari list ids (newest-first): {ids[0]}..{ids[-1]} ({len(links)} links)")
     return links
 
 
