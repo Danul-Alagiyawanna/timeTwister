@@ -978,60 +978,51 @@ def _normalize_article_link(url: str) -> str:
 
 
 def _article_id_from_dailymirror_link(link: str) -> int:
-    """Numeric story id from …/108-341946 style URLs."""
-    m = re.search(r"-(\d+)/?$", (link or "").rstrip("/"))
+    """Story id from …/108-341946 or …/107-342255 (section prefix may differ)."""
+    path = (link or "").rstrip("/")
+    m = re.search(r"/(\d+)-(\d+)$", path)
+    if m:
+        return int(m.group(2))
+    m = re.search(r"-(\d+)$", path)
     return int(m.group(1)) if m else 0
 
 
-def _dailymirror_story_key(link: str) -> str:
-    """Stable id across breaking-news vs latest-news path variants."""
-    aid = _article_id_from_dailymirror_link(link)
-    if aid:
-        return f"108-{aid}"
-    return _normalize_article_link(link)
-
-
-def _dailymirror_boundary_keys(json_path: str) -> tuple[str | None, set[str]]:
-    """Checkpoint story key plus keys from the replace-only delta file."""
+def _dailymirror_boundary_ids(json_path: str) -> tuple[int | None, set[int]]:
+    """Checkpoint story id plus ids from the replace-only delta file."""
     from incremental import _load_articles_list, get_last_scraped_checkpoint
 
     checkpoint_link, _ = get_last_scraped_checkpoint(json_path)
-    checkpoint_key = (
-        _dailymirror_story_key(checkpoint_link) if checkpoint_link else None
-    )
-    known: set[str] = set()
+    checkpoint_id = _article_id_from_dailymirror_link(checkpoint_link or "")
+    known: set[int] = set()
     for item in _load_articles_list(json_path):
-        if isinstance(item, dict) and item.get("link"):
-            known.add(_dailymirror_story_key(item["link"]))
-    if checkpoint_key:
-        known.add(checkpoint_key)
-    return checkpoint_key, known
+        if not isinstance(item, dict):
+            continue
+        aid = _article_id_from_dailymirror_link(item.get("link", ""))
+        if aid:
+            known.add(aid)
+    if checkpoint_id:
+        known.add(checkpoint_id)
+    return (checkpoint_id or None), known
 
 
 def _dailymirror_stop_reason(
     link: str,
     *,
-    checkpoint_key: str | None,
-    known_keys: set[str],
+    checkpoint_id: int | None,
+    known_ids: set[int],
 ) -> str | None:
     """
-    Newest-first list: stop at checkpoint story id or anything older than it.
-    URL paths differ (breaking-news vs latest-news) but story ids match.
+    Newest-first list: stop at checkpoint story id (no article fetch).
+    Matches across /108-… vs /107-… URL prefixes.
     """
-    key = _dailymirror_story_key(link)
     link_id = _article_id_from_dailymirror_link(link)
-    cp_id = 0
-    if checkpoint_key and checkpoint_key.startswith("108-"):
-        try:
-            cp_id = int(checkpoint_key.split("-", 1)[1])
-        except ValueError:
-            cp_id = 0
-
-    if checkpoint_key and key == checkpoint_key:
+    if not link_id:
+        return None
+    if checkpoint_id and link_id == checkpoint_id:
         return "checkpoint"
-    if cp_id and link_id and link_id < cp_id:
+    if checkpoint_id and link_id < checkpoint_id:
         return "known_previous"
-    if key in known_keys:
+    if link_id in known_ids:
         return "known_previous"
     return None
 
@@ -1262,29 +1253,29 @@ def main_incremental():
     from incremental_runner import data_json_path, save_replace_only
 
     json_path = data_json_path("dailymirror_latest_news.json")
-    checkpoint_key, known_keys = _dailymirror_boundary_keys(json_path)
-    bootstrap = not checkpoint_key
+    checkpoint_id, known_ids = _dailymirror_boundary_ids(json_path)
+    bootstrap = not checkpoint_id
     max_articles = (
         INCREMENTAL_BOOTSTRAP_LIMIT if bootstrap else INCREMENTAL_RUN_LIMIT
     )
 
-    if known_keys:
+    if known_ids:
         print(
-            f"[INCREMENTAL] Boundary set: {len(known_keys)} story id(s) "
+            f"[INCREMENTAL] Boundary set: {len(known_ids)} story id(s) "
             "(archive + checkpoint)"
         )
-    print("[INCREMENTAL] Daily Mirror - stop by story id (108-NNNNN)")
+    print("[INCREMENTAL] Daily Mirror - stop by numeric story id")
     if bootstrap:
         print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
     else:
         print(
-            f"[INCREMENTAL] Checkpoint story {checkpoint_key}; "
+            f"[INCREMENTAL] Checkpoint story id {checkpoint_id}; "
             f"run safety cap {max_articles}"
         )
 
     driver = create_driver()
     new_articles: list[dict] = []
-    seen_this_run: set[str] = set()
+    seen_this_run: set[int] = set()
 
     try:
         print(f"\n{'=' * 50}\n[INCREMENTAL] Daily Mirror / latest\n{BASE_URL}")
@@ -1296,22 +1287,37 @@ def main_incremental():
             )
             return 0
 
+        head_id = _article_id_from_dailymirror_link(links[0])
+        head_stop = _dailymirror_stop_reason(
+            links[0],
+            checkpoint_id=checkpoint_id,
+            known_ids=known_ids,
+        )
+        if head_stop:
+            print(
+                f"\n[INCREMENTAL] List head is already scraped "
+                f"(id {head_id}, {head_stop}) — caught up, no fetch"
+            )
+            print(f"             {links[0]}")
+            save_replace_only(json_path, [])
+            return 0
+
         for i, link in enumerate(links, 1):
-            story_key = _dailymirror_story_key(link)
+            link_id = _article_id_from_dailymirror_link(link)
             stop = _dailymirror_stop_reason(
                 link,
-                checkpoint_key=checkpoint_key,
-                known_keys=known_keys,
+                checkpoint_id=checkpoint_id,
+                known_ids=known_ids,
             )
             if stop:
                 print(f"\n[INCREMENTAL] Reached boundary ({stop}) - stopping.")
-                print(f"             {link} ({story_key})")
+                print(f"             {link} (id {link_id})")
                 break
 
-            if story_key in seen_this_run:
+            if link_id in seen_this_run:
                 continue
 
-            print(f"\n[INFO] New {i}: {link[:80]}... ({story_key})")
+            print(f"\n[INFO] New {i}: {link[:80]}... (id {link_id})")
             try:
                 row = fetch_article_incremental(driver, link)
                 if row:
@@ -1323,7 +1329,7 @@ def main_incremental():
                         print(f"[SKIP] Empty row (no title/body): {link[:80]}...")
                         continue
                     new_articles.append(row)
-                    seen_this_run.add(story_key)
+                    seen_this_run.add(link_id)
             except Exception as e:
                 print(f"[ERROR] Article failed: {e}")
 
