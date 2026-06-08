@@ -28,8 +28,10 @@ from selenium.webdriver.support import expected_conditions as EC
 import re
 import threading
 from functools import wraps
+from urllib.parse import urljoin
 
 BASE_URL = "https://www.dailymirror.lk/latest-news/108"
+_ARTICLE_HREF_RE = re.compile(r"/108-\d+/?")
 
 # List-page metadata keyed by normalized URL (used when article page extract fails on CI)
 _LIST_PAGE_HINTS: dict[str, dict] = {}
@@ -788,42 +790,185 @@ def process_articles_from_list_page(driver, list_url, start_date, end_date):
     return articles_found, articles_in_range, articles_outside_range
 
 
-def _prepare_list_page(driver, list_url: str) -> bool:
-    """Navigate to a list page and wait for Cloudflare / article container (shared with incremental)."""
+def _page_has_dailymirror_articles(driver) -> bool:
     try:
-        driver.get(list_url)
-        WebDriverWait(driver, 30).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-        time.sleep(5)
-    except Exception as e:
-        print(f"[ERROR] Failed to navigate to list page: {e}")
+        return bool(_ARTICLE_HREF_RE.search(driver.page_source or ""))
+    except Exception:
         return False
 
-    try:
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.XPATH, "/html/body/div[7]/div/div/div/div[1]/div[2]"))
-        )
-        return True
-    except Exception:
-        page_source_lower = driver.page_source.lower()
-        if (
-            "cloudflare" in page_source_lower
-            or "challenge" in page_source_lower
-            or "checking your browser" in page_source_lower
-        ):
-            print("[WARNING] Cloudflare challenge — waiting longer...")
-            time.sleep(10)
-            try:
-                WebDriverWait(driver, 30).until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, "/html/body/div[7]/div/div/div/div[1]/div[2]")
-                    )
-                )
-                return True
-            except Exception:
-                return False
+
+def _wait_for_list_articles(driver, *, timeout: int = 40) -> bool:
+    """Wait for any article link pattern — not a fixed body/div index (breaks on GHA)."""
+    locators = (
+        (By.CSS_SELECTOR, "a[href*='/108-'] h3"),
+        (By.XPATH, "//a[contains(@href,'/108-')]/h3"),
+        (By.XPATH, "/html/body/div[7]/div/div/div/div[1]/div[2]"),
+        (By.CSS_SELECTOR, "a[href*='/108-']"),
+    )
+    for by, selector in locators:
+        try:
+            WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((by, selector))
+            )
+            print(f"[INFO] List page ready ({selector[:50]})")
+            return True
+        except Exception:
+            continue
+    return _page_has_dailymirror_articles(driver)
+
+
+def _maybe_wait_cloudflare(driver) -> bool:
+    page_source_lower = (driver.page_source or "").lower()
+    if not any(
+        m in page_source_lower
+        for m in ("cloudflare", "challenge", "checking your browser")
+    ):
         return False
+    print("[WARNING] Cloudflare challenge — waiting longer...")
+    time.sleep(15)
+    return True
+
+
+def _prepare_list_page(driver, list_url: str) -> bool:
+    """Navigate to list page with retries (GHA timeouts / layout changes)."""
+    import os
+
+    is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
+    load_timeout = 90 if is_ci else 60
+    settle = 8 if is_ci else 5
+
+    try:
+        driver.set_page_load_timeout(load_timeout)
+    except Exception:
+        pass
+
+    for attempt in range(1, 4):
+        try:
+            driver.get(list_url)
+        except Exception as e:
+            print(f"[WARN] driver.get attempt {attempt}/3: {e}")
+            if not _page_has_dailymirror_articles(driver):
+                if attempt < 3:
+                    time.sleep(6)
+                    continue
+                return False
+
+        try:
+            WebDriverWait(driver, 40).until(
+                lambda d: d.execute_script("return document.readyState")
+                in ("complete", "interactive")
+            )
+        except Exception:
+            pass
+
+        time.sleep(settle)
+
+        if _wait_for_list_articles(driver, timeout=40 if is_ci else 30):
+            return True
+
+        if _maybe_wait_cloudflare(driver) and _wait_for_list_articles(
+            driver, timeout=35
+        ):
+            return True
+
+        if _page_has_dailymirror_articles(driver):
+            print("[INFO] Article links found in page source (fallback)")
+            return True
+
+        print(f"[WARN] List page attempt {attempt}/3 — no articles yet")
+        if attempt < 3:
+            try:
+                driver.refresh()
+            except Exception:
+                pass
+            time.sleep(6)
+
+    return _page_has_dailymirror_articles(driver)
+
+
+def _collect_links_xpath(driver) -> list[str]:
+    """Primary: legacy XPath list rows (title, date, image hints)."""
+    links: list[str] = []
+    for i in range(1, 31):
+        base_xpath = f"/html/body/div[7]/div/div/div/div[1]/div[2]/div[{i}]"
+        heading_xpath = f"{base_xpath}/div/div[1]/a[2]/h3"
+        date_xpath = f"{base_xpath}/div/div[1]/div/div[1]/h4"
+        description_xpath = f"{base_xpath}/div/div[1]/a[3]/p"
+        image_xpath = f"{base_xpath}/div/div[2]/a/img"
+        try:
+            heading = driver.find_element(By.XPATH, heading_xpath)
+            parent = heading.find_element(By.XPATH, "..")
+            href = parent.get_attribute("href")
+            if not href:
+                continue
+            title = (heading.text or "").strip()
+            try:
+                date_text = driver.find_element(By.XPATH, date_xpath).text.strip()
+            except Exception:
+                date_text = ""
+            try:
+                description = driver.find_element(By.XPATH, description_xpath).text.strip()
+            except Exception:
+                description = ""
+            try:
+                image_url = (
+                    driver.find_element(By.XPATH, image_xpath).get_attribute("src") or ""
+                )
+            except Exception:
+                image_url = ""
+            links.append(href)
+            _LIST_PAGE_HINTS[_normalize_article_link(href)] = {
+                "title": title,
+                "list_description": description,
+                "list_image": image_url,
+                "date_text": date_text,
+            }
+        except Exception:
+            break
+    return links
+
+
+def _collect_links_fallback(driver) -> list[str]:
+    """DOM-order links from page HTML when XPath layout index drifts."""
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    base = "https://www.dailymirror.lk"
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for h3 in soup.find_all("h3"):
+        parent = h3.find_parent("a", href=True)
+        if not parent:
+            continue
+        href = (parent.get("href") or "").strip()
+        if not _ARTICLE_HREF_RE.search(href):
+            continue
+        full = urljoin(base, href).split("?")[0]
+        norm = _normalize_article_link(full)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        links.append(full)
+        title = h3.get_text(strip=True)
+        if title and norm not in _LIST_PAGE_HINTS:
+            _LIST_PAGE_HINTS[norm] = {"title": title, "list_description": "", "list_image": "", "date_text": ""}
+
+    if links:
+        print(f"[INFO] Fallback HTML parse: {len(links)} article link(s)")
+        return links
+
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not _ARTICLE_HREF_RE.search(href):
+            continue
+        full = urljoin(base, href).split("?")[0]
+        norm = _normalize_article_link(full)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        links.append(full)
+    if links:
+        print(f"[INFO] Fallback anchor scan: {len(links)} article link(s)")
+    return links
 
 
 def _normalize_article_link(url: str) -> str:
@@ -917,50 +1062,30 @@ def sort_dailymirror_articles_newest_first(articles: list[dict]) -> list[dict]:
     )
 
 
-def collect_list_page_links(driver, list_url: str) -> list[str]:
-    """Ordered article URLs from one list page (same XPath as date-range main)."""
+def collect_list_page_links(driver, list_url: str) -> tuple[list[str], bool]:
+    """
+    Ordered article URLs from one list page.
+    Returns (links, list_page_ok). list_page_ok=False on navigation failure — do not wipe JSON.
+    """
     global _LIST_PAGE_HINTS
     _LIST_PAGE_HINTS = {}
     if not _prepare_list_page(driver, list_url):
-        return []
-    links: list[str] = []
-    for i in range(1, 31):
-        base_xpath = f"/html/body/div[7]/div/div/div/div[1]/div[2]/div[{i}]"
-        heading_xpath = f"{base_xpath}/div/div[1]/a[2]/h3"
-        date_xpath = f"{base_xpath}/div/div[1]/div/div[1]/h4"
-        description_xpath = f"{base_xpath}/div/div[1]/a[3]/p"
-        image_xpath = f"{base_xpath}/div/div[2]/a/img"
-        try:
-            heading = driver.find_element(By.XPATH, heading_xpath)
-            parent = heading.find_element(By.XPATH, "..")
-            href = parent.get_attribute("href")
-            if not href:
-                continue
-            title = (heading.text or "").strip()
-            try:
-                date_text = driver.find_element(By.XPATH, date_xpath).text.strip()
-            except Exception:
-                date_text = ""
-            try:
-                description = driver.find_element(By.XPATH, description_xpath).text.strip()
-            except Exception:
-                description = ""
-            try:
-                image_url = driver.find_element(By.XPATH, image_xpath).get_attribute("src") or ""
-            except Exception:
-                image_url = ""
-            links.append(href)
-            _LIST_PAGE_HINTS[_normalize_article_link(href)] = {
-                "title": title,
-                "list_description": description,
-                "list_image": image_url,
-                "date_text": date_text,
-            }
-        except Exception:
-            break
+        print("[ERROR] Could not load Daily Mirror list page")
+        return [], False
+
+    links = _collect_links_xpath(driver)
+    if not links:
+        links = _collect_links_fallback(driver)
+
+    if not links:
+        print("[ERROR] List page loaded but no article links found")
+        return [], False
+
     links = _order_links_newest_first(links)
-    print(f"[INFO] collect_list_page_links: {len(links)} URLs (newest-first) from {list_url}")
-    return links
+    print(
+        f"[INFO] collect_list_page_links: {len(links)} URLs (newest-first) from {list_url}"
+    )
+    return links, True
 
 
 def create_driver(headless=None):
@@ -1163,8 +1288,13 @@ def main_incremental():
 
     try:
         print(f"\n{'=' * 50}\n[INCREMENTAL] Daily Mirror / latest\n{BASE_URL}")
-        links = collect_list_page_links(driver, BASE_URL)
+        links, list_ok = collect_list_page_links(driver, BASE_URL)
         print(f"[INFO] {len(links)} links on list page")
+        if not list_ok:
+            print(
+                "[ERROR] List page unavailable — keeping existing JSON and checkpoint"
+            )
+            return 0
 
         for i, link in enumerate(links, 1):
             story_key = _dailymirror_story_key(link)
