@@ -23,6 +23,7 @@ from incremental_links import (
     collect_divaina_breaking_links,
     collect_divaina_main_links,
     collect_thamilan_links,
+    collect_thinakaran_links,
     collect_virakesari_links,
     virakesari_article_id,
     collect_wp_category_links,
@@ -903,19 +904,160 @@ def run_virakesari_incremental() -> int:
 
 
 def run_thinakaran_incremental() -> int:
-    mod = _import_scraper("thinakaran_selenium_json")
-    cats = ["local", "politics", "features", "editorial", "sports", "business"]
-    pages = [(c, f"https://www.thinakaran.lk/category/{c}/") for c in cats]
-    collect = lambda d, u: collect_wp_category_links(d, u, "thinakaran")
-
-    return run_incremental_scraper(
-        outlet_name="Thinakaran",
-        data_filename="thinakaran_latest_news.json",
-        pages=pages,
-        collect_links=collect,
-        fetch_article=lambda d, l: _fetch_content(d, l, mod),
-        use_undetected=True,
+    """Thinakaran-only incremental loop (isolated from shared per-section runner)."""
+    from incremental import (
+        INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
+        INCREMENTAL_RUN_LIMIT_PER_SECTION,
+        get_section_checkpoint,
+        migrate_global_checkpoint_to_sections,
+        normalize_link,
+        save_replace_only,
+        sync_global_checkpoint_from_sections,
+        title_for_checkpoint_link,
+        update_section_checkpoints,
     )
+    from incremental_runner import data_json_path
+
+    mod = _import_scraper("thinakaran_selenium_json")
+    pages = [
+        (c, f"https://www.thinakaran.lk/category/{c}/")
+        for c in ("local", "politics", "features", "editorial", "sports", "business")
+    ]
+    json_path = data_json_path("thinakaran_latest_news.json")
+    section_keys = [name for name, _ in pages]
+    migrate_global_checkpoint_to_sections(json_path, section_keys)
+    bootstrap = not any(get_section_checkpoint(json_path, k)[0] for k in section_keys)
+    max_articles = (
+        INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION
+        if bootstrap
+        else INCREMENTAL_RUN_LIMIT_PER_SECTION
+    )
+
+    print("[INCREMENTAL] Thinakaran — per-section checkpoints (isolated runner)")
+    if bootstrap:
+        print(f"[INCREMENTAL] No section checkpoint; bootstrap max {max_articles} per section")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles per section")
+
+    driver = mod.create_driver()
+    new_articles: list[dict[str, Any]] = []
+    saved_urls: set[str] = set()
+    section_links: dict[str, list[str]] = {}
+    section_checkpoint_updates: dict[str, tuple[str, str]] = {}
+
+    try:
+        print("\n[INCREMENTAL] Phase 1 — list pages")
+        for name, page_url in pages:
+            print(f"\n{'=' * 50}\n[INCREMENTAL] Thinakaran / {name}\n{page_url}")
+            try:
+                links = collect_thinakaran_links(driver, page_url)
+                section_links[name] = links
+                print(f"[INFO] {len(links)} links on list page")
+            except Exception as e:
+                print(f"[ERROR] List page failed ({name}): {e}")
+                section_links[name] = []
+            time.sleep(2.0)
+
+        if sum(len(v) for v in section_links.values()) == 0:
+            print(
+                "[ERROR] All Thinakaran list pages empty — "
+                "keeping checkpoints and JSON unchanged"
+            )
+            return 0
+
+        print("\n[INCREMENTAL] Phase 2 — fetch new articles per section")
+        fetch_article = lambda d, l: _fetch_content(d, l, mod)
+
+        for name, _page_url in pages:
+            links = section_links.get(name, [])
+            if not links:
+                print(f"  [SKIP] {name} — no list links, checkpoint unchanged")
+                continue
+
+            sec_ckpt, sec_ckpt_title = get_section_checkpoint(json_path, name)
+            sec_ckpt_norm = normalize_link(sec_ckpt or "")
+            print(
+                f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}"
+            )
+
+            if sec_ckpt_norm and links and normalize_link(links[0]) == sec_ckpt_norm:
+                print(f"  [CAUGHT UP] {name} — list head matches checkpoint")
+                section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
+                continue
+
+            page_new = 0
+            first_new_link: str | None = None
+            hit_checkpoint = False
+
+            for i, link in enumerate(links, 1):
+                norm = normalize_link(link)
+                if sec_ckpt_norm and norm == sec_ckpt_norm:
+                    print("  [STOP] Reached section checkpoint")
+                    hit_checkpoint = True
+                    break
+                if norm in saved_urls:
+                    continue
+
+                print(f"\n[INFO] New {i} ({name}): {link[:80]}...")
+                try:
+                    row = fetch_article(driver, link)
+                    if row:
+                        title = (row.get("title") or "").strip()
+                        summary = (
+                            (row.get("summary") or row.get("description") or "")
+                        ).strip()
+                        if not title and not summary:
+                            print(f"[SKIP] Empty row (no title/body): {link[:80]}...")
+                            continue
+                        row["section"] = name
+                        new_articles.append(row)
+                        saved_urls.add(norm)
+                        page_new += 1
+                        if first_new_link is None:
+                            first_new_link = link
+                except Exception as e:
+                    print(f"[ERROR] Article failed: {e}")
+
+                if page_new >= max_articles:
+                    label = "Bootstrap" if bootstrap else "Run safety"
+                    print(
+                        f"[INCREMENTAL] {label} limit ({max_articles}) "
+                        f"for {name} — next section"
+                    )
+                    break
+
+                time.sleep(0.5)
+
+            if page_new > 0 and first_new_link:
+                section_checkpoint_updates[name] = (
+                    first_new_link,
+                    title_for_checkpoint_link(
+                        first_new_link, new_articles, json_path
+                    ),
+                )
+            elif hit_checkpoint and sec_ckpt:
+                section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
+
+    finally:
+        driver.quit()
+
+    new_articles = [
+        a
+        for a in new_articles
+        if (a.get("title") or "").strip()
+        or (a.get("summary") or a.get("description") or "").strip()
+    ]
+    print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
+
+    if section_checkpoint_updates:
+        update_section_checkpoints(json_path, section_checkpoint_updates)
+        sync_global_checkpoint_from_sections(json_path)
+        for sec_name, (url, _) in section_checkpoint_updates.items():
+            print(f"  [CKPT] {sec_name}: {url[:70]}")
+
+    save_replace_only(json_path, new_articles)
+    print("[INCREMENTAL] Thinakaran finished.")
+    return len(new_articles)
 
 
 def _fetch_thamilan(driver, link: str, mod: Any) -> dict | None:

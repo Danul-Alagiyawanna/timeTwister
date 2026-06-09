@@ -374,7 +374,7 @@ def collect_lankadeepa_links(driver: Any, url: str) -> list[str]:
 
 
 def collect_wp_category_links(driver: Any, url: str, site: str) -> list[str]:
-    """Dinamina / Thinakaran style category pages."""
+    """Dinamina-style category pages."""
     _navigate(driver, url.rstrip("/") + "/", 3)
     soup = BeautifulSoup(driver.page_source, "html.parser")
     base = f"https://www.{site}.lk"
@@ -387,6 +387,83 @@ def collect_wp_category_links(driver: Any, url: str, site: str) -> list[str]:
         if href.startswith("http") and site in href and href not in seen:
             seen.add(href)
             links.append(href)
+    return links
+
+
+def _thinakaran_page_ready(driver: Any) -> bool:
+    title = (driver.title or "").strip().lower()
+    src = (driver.page_source or "").lower()
+    if "just a moment" in title or "checking your browser" in src:
+        return False
+    return "penci-wrapper-data" in src or "penci-entry-title" in src
+
+
+def collect_thinakaran_links(driver: Any, url: str) -> list[str]:
+    """Thinakaran category feed — scroll + ul.penci-wrapper-data (matches main scraper)."""
+    import os
+
+    is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
+    page_url = url.rstrip("/") + "/"
+    settle = 6 if is_ci else 3
+    wait_timeout = 45 if is_ci else 25
+    links: list[str] = []
+
+    for attempt in range(1, 4):
+        try:
+            driver.get(page_url)
+        except Exception as e:
+            print(f"[WARN] Thinakaran driver.get attempt {attempt}/3: {e}")
+        try:
+            WebDriverWait(driver, wait_timeout).until(
+                lambda d: _thinakaran_page_ready(d)
+            )
+        except Exception:
+            pass
+        time.sleep(settle)
+
+        try:
+            for _ in range(6):
+                prev = driver.execute_script("return document.body.scrollHeight")
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2 if is_ci else 1)
+                if driver.execute_script("return document.body.scrollHeight") == prev:
+                    break
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(1)
+        except Exception:
+            pass
+
+        seen: set[str] = set()
+        try:
+            container = driver.find_element(By.CSS_SELECTOR, "ul.penci-wrapper-data")
+            for article in container.find_elements(By.TAG_NAME, "article"):
+                try:
+                    a = article.find_element(By.CSS_SELECTOR, "h2.penci-entry-title a")
+                    href = (a.get_attribute("href") or "").strip()
+                    if href and href not in seen:
+                        seen.add(href)
+                        links.append(href.split("?")[0])
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if links:
+            break
+        print(
+            f"[WARN] Thinakaran list attempt {attempt}/3 — "
+            f"title={driver.title!r} src={len(driver.page_source or '')} bytes"
+        )
+        if attempt < 3:
+            time.sleep(6)
+
+    if links:
+        print(f"[INFO] Thinakaran list: {len(links)} link(s) from {page_url}")
+    else:
+        print(
+            f"[ERROR] Thinakaran list empty — title={driver.title!r} "
+            f"src={len(driver.page_source or '')} bytes"
+        )
     return links
 
 
