@@ -554,6 +554,76 @@ def process_articles_from_list_page(driver, list_url, start_date, end_date):
     print(f"\n   Page summary: {articles_in_range} in range, {articles_outside_range} outside range")
     return articles_found, articles_in_range, articles_outside_range
 
+
+def create_driver(headless=None):
+    """UC-first Chrome; headless on CI (GHA has no display)."""
+    import os
+
+    if headless is None:
+        headless = os.getenv("CI", "").lower() in ("1", "true", "yes")
+
+    prefs = {"profile.default_content_setting_values": {"popups": 1}}
+
+    if USE_UNDETECTED:
+        print("[INFO] Using undetected-chromedriver to bypass Cloudflare...")
+
+        def _uc_options():
+            opts = uc.ChromeOptions()
+            opts.page_load_strategy = "eager"
+            if headless:
+                opts.add_argument("--headless=new")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_experimental_option("prefs", prefs)
+            return opts
+
+        try:
+            driver = uc.Chrome(options=_uc_options(), use_subprocess=True)
+            print("[INFO] Undetected Chrome started successfully")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[WARNING] UC initial attempt failed: {error_msg}")
+            match = re.search(r"Current browser version is (\d+)", error_msg)
+            if not match:
+                match = re.search(r"only supports Chrome version (\d+)", error_msg)
+            if match:
+                major = int(match.group(1))
+                print(f"[INFO] Retrying UC with version_main={major}")
+                driver = uc.Chrome(
+                    options=_uc_options(),
+                    use_subprocess=True,
+                    version_main=major,
+                )
+            else:
+                raise
+    else:
+        print("[WARNING] Falling back to regular Selenium (may be blocked)...")
+        chrome_options = Options()
+        chrome_options.page_load_strategy = "eager"
+        if headless:
+            chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
+        chrome_options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        chrome_options.add_experimental_option("prefs", prefs)
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=chrome_options,
+        )
+        driver.execute_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+
+    driver.set_page_load_timeout(90 if headless else 60)
+    return driver
+
+
 def main(start_date=None, end_date=None):
     """Main function with click-and-back navigation approach."""
     
@@ -566,97 +636,7 @@ def main(start_date=None, end_date=None):
         print(f"[DATE] Scraping articles from {start_date} to {end_date}")
     
     print("[INFO] Starting Virakesari scraper with click-and-back navigation...")
-    
-    import os
-    
-    if USE_UNDETECTED:
-        print("[INFO] Using undetected-chromedriver to bypass Cloudflare...")
-        
-        options = uc.ChromeOptions()
-        options.page_load_strategy = 'eager'
-        # options.add_argument('--headless')  # Disabled for debugging
-        
-        # Disable popup blocking to allow new tabs
-        prefs = {
-            "profile.default_content_setting_values": {
-                "popups": 1  # Allow popups
-            }
-        }
-        options.add_experimental_option("prefs", prefs)
-        
-        print(f"[INFO] Starting undetected Chrome (bypasses Cloudflare automatically)...")
-        
-        try:
-            # Let undetected-chromedriver auto-detect Chrome version
-            driver = uc.Chrome(options=options, use_subprocess=True)
-            print("[INFO] Undetected Chrome browser started successfully")
-        except Exception as e:
-            error_msg = str(e)
-            print(f"[WARNING] Initial attempt failed: {error_msg}")
-
-            # Try to extract the installed Chrome major version from the error message
-            match = re.search(r"Current browser version is (\d+)", error_msg)
-            if not match:
-                match = re.search(r"only supports Chrome version (\d+)", error_msg)
-
-            if match:
-                major_version = int(match.group(1))
-                print(f"[INFO] Mismatched chromedriver. Retrying with version_main={major_version}...")
-                try:
-                    options_retry = uc.ChromeOptions()
-                    options_retry.page_load_strategy = 'eager'
-                    options_retry.add_experimental_option("prefs", {"profile.default_content_setting_values": {"popups": 1}})
-                    driver = uc.Chrome(options=options_retry, use_subprocess=True, version_main=major_version)
-                    print(f"[INFO] Undetected Chrome browser (forced version {major_version}) started successfully")
-                except Exception as retry_err:
-                    print(f"[WARNING] Retry with version_main={major_version} failed: {retry_err}")
-                    print(f"[INFO] Trying with fresh ChromeOptions and version_main={major_version}...")
-                    options_retry2 = uc.ChromeOptions()
-                    options_retry2.page_load_strategy = 'eager'
-                    options_retry2.add_experimental_option("prefs", {"profile.default_content_setting_values": {"popups": 1}})
-                    driver = uc.Chrome(options=options_retry2, use_subprocess=True, version_main=major_version)
-                    print(f"[INFO] Undetected Chrome browser (forced version {major_version}) started successfully")
-            else:
-                print(f"[INFO] Trying with fresh ChromeOptions...")
-                options_retry2 = uc.ChromeOptions()
-                options_retry2.page_load_strategy = 'eager'
-                options_retry2.add_experimental_option("prefs", {"profile.default_content_setting_values": {"popups": 1}})
-                driver = uc.Chrome(options=options_retry2, use_subprocess=True)
-                print(f"[INFO] Undetected Chrome browser started successfully")
-    else:
-        print("[WARNING] undetected-chromedriver not installed. Install with: pip install undetected-chromedriver")
-        print("[INFO] Falling back to regular Selenium (may be blocked by Cloudflare)...")
-        
-        chrome_options = Options()
-        chrome_options.page_load_strategy = 'eager'
-        # chrome_options.add_argument('--headless')  # Disabled for debugging
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        
-        # Disable popup blocking to allow new tabs
-        prefs = {
-            "profile.default_content_setting_values": {
-                "popups": 1  # Allow popups
-            }
-        }
-        chrome_options.add_experimental_option("prefs", prefs)
-
-        service = Service(ChromeDriverManager().install())
-        print(f"[INFO] Starting Chrome browser...")
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        print(f"[INFO] Chrome browser started successfully")
-        
-        # Add stealth settings
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        print(f"[INFO] Stealth settings applied")
-    
-    # Set page load timeout to prevent hanging
-    driver.set_page_load_timeout(60)  # 60 seconds timeout
-    print(f"[INFO] Page load timeout set to 60 seconds")
+    driver = create_driver(headless=False)
 
     categories = ["local", "world", "sports", "feature", "cinema", "business"]
     scraped_urls = set()

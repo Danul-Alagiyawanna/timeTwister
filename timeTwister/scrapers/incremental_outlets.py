@@ -738,7 +738,7 @@ def run_virakesari_incremental() -> int:
         title_for_checkpoint_link,
         update_section_checkpoints,
     )
-    from incremental_runner import create_standard_driver, data_json_path
+    from incremental_runner import data_json_path
 
     mod = _import_scraper("virakesari_selenium_json")
     pages = [
@@ -763,7 +763,7 @@ def run_virakesari_incremental() -> int:
             f"[INCREMENTAL] Run safety cap: {max_articles} new articles per section"
         )
 
-    driver = create_standard_driver(use_undetected=True)
+    driver = mod.create_driver()
     new_articles: list[dict[str, Any]] = []
     saved_ids: set[int] = set()
     section_links: dict[str, list[str]] = {}
@@ -782,11 +782,22 @@ def run_virakesari_incremental() -> int:
                 section_links[name] = []
             time.sleep(2.0)
 
+        total_links = sum(len(v) for v in section_links.values())
+        if total_links == 0:
+            print(
+                "[ERROR] All Virakesari list pages empty — "
+                "keeping checkpoints and JSON unchanged"
+            )
+            return 0
+
         print("\n[INCREMENTAL] Phase 2 — fetch new articles per section")
         fetch_article = lambda d, l: _fetch_content(d, l, mod)
 
         for name, _page_url in pages:
             links = section_links.get(name, [])
+            if not links:
+                print(f"  [SKIP] {name} — no list links, checkpoint unchanged")
+                continue
             sec_ckpt, sec_ckpt_title = get_section_checkpoint(json_path, name)
             cp_id = virakesari_article_id(sec_ckpt or "") if sec_ckpt else 0
             print(
@@ -855,8 +866,6 @@ def run_virakesari_incremental() -> int:
                     ),
                 )
             elif hit_checkpoint and sec_ckpt:
-                section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
-            elif sec_ckpt:
                 section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
 
     finally:
