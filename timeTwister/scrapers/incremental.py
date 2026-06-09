@@ -133,10 +133,18 @@ def migrate_global_checkpoint_to_sections(
         return False
     sections = state.get("sections") or {}
     global_title = state.get("last_scraped_title") or ""
+    has_any_section = any(
+        isinstance(sections.get(key), dict) and sections[key].get("last_scraped_link")
+        for key in section_keys
+    )
     updates: dict[str, tuple[str, str]] = {}
     for key in section_keys:
         entry = sections.get(key)
         if isinstance(entry, dict) and entry.get("last_scraped_link"):
+            continue
+        # Do not copy one global URL into every empty section once any section
+        # already has its own boundary (prevents LOCAL/NORTH bleed on multi-feed outlets).
+        if has_any_section:
             continue
         updates[key] = (global_link, global_title)
     if not updates:
@@ -214,6 +222,69 @@ def filter_cross_section_promo_links(
         name: [link for link in links if normalize_link(link) not in promos]
         for name, links in section_links.items()
     }
+
+
+def clear_global_bleed_section_checkpoints(
+    articles_json_path: str,
+    section_keys: list[str],
+) -> int:
+    """
+    Drop section checkpoints that duplicate the legacy global URL when 2+ sections
+    share it (migrate_global_checkpoint_to_sections bleed).
+    """
+    if not section_keys:
+        return 0
+    state = load_checkpoint_state(articles_json_path)
+    global_link = normalize_link(state.get("last_scraped_link") or "")
+    if not global_link:
+        return 0
+    sections: dict[str, Any] = dict(state.get("sections") or {})
+    duped_keys = [
+        key
+        for key in section_keys
+        if isinstance(sections.get(key), dict)
+        and normalize_link(sections[key].get("last_scraped_link") or "") == global_link
+    ]
+    if len(duped_keys) < 2:
+        return 0
+    for key in duped_keys:
+        sections.pop(key, None)
+    state["sections"] = sections
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    cp_path = _checkpoint_path(articles_json_path)
+    os.makedirs(os.path.dirname(cp_path) or ".", exist_ok=True)
+    with open(cp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    print(
+        f"[INCREMENTAL] Cleared global-bleed checkpoint from {len(duped_keys)} section(s): "
+        f"{', '.join(duped_keys)}"
+    )
+    return len(duped_keys)
+
+
+def prune_alias_section_keys(
+    articles_json_path: str,
+    canonical_keys: list[str],
+) -> int:
+    """Keep only canonical section keys (drops lowercase duplicates and orphans)."""
+    state = load_checkpoint_state(articles_json_path)
+    sections: dict[str, Any] = dict(state.get("sections") or {})
+    canonical = set(canonical_keys)
+    removed = 0
+    for key in list(sections.keys()):
+        if key in canonical:
+            continue
+        sections.pop(key, None)
+        removed += 1
+    if not removed:
+        return 0
+    state["sections"] = sections
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    cp_path = _checkpoint_path(articles_json_path)
+    with open(cp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    print(f"[INCREMENTAL] Removed {removed} alias section checkpoint key(s)")
+    return removed
 
 
 def apply_section_head_checkpoints(

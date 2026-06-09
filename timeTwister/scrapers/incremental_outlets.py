@@ -1204,25 +1204,33 @@ def _run_thinakaran_incremental_selenium() -> int:
     return len(new_articles)
 
 
-def _fetch_thamilan(driver, link: str, mod: Any) -> dict | None:
-    driver.get(link)
-    time.sleep(2)
-    meta = mod.extract_article_content(driver)
-    if not meta:
-        return None
-    return article_from_content(meta, link)
-
-
 def run_thamilan_incremental() -> int:
+    from incremental import (
+        clear_global_bleed_section_checkpoints,
+        prune_alias_section_keys,
+    )
+
     mod = _import_scraper("thamilan_selenium_json")
     pages = list(mod.CATEGORY_URLS)
+    json_path = data_json_path("thamilan_latest_news.json")
+    section_keys = [name for name, _ in pages]
+    prune_alias_section_keys(json_path, section_keys)
+    clear_global_bleed_section_checkpoints(json_path, section_keys)
+
+    def fetch(d, link: str) -> dict | None:
+        d.get(link)
+        time.sleep(2)
+        meta = mod.extract_article_content(d)
+        if not meta:
+            return None
+        return article_from_content(meta, link)
 
     return run_incremental_scraper(
         outlet_name="Thamilan",
         data_filename="thamilan_latest_news.json",
         pages=pages,
         collect_links=collect_thamilan_links,
-        fetch_article=lambda d, l: _fetch_thamilan(d, l, mod),
+        fetch_article=fetch,
         use_undetected=True,
     )
 
