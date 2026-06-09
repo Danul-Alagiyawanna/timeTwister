@@ -390,7 +390,7 @@ def merge_and_save(
 
 
 def sync_global_checkpoint_from_sections(articles_json_path: str) -> bool:
-    """Set global checkpoint to the newest section boundary (by URL date)."""
+    """Set global checkpoint to the newest section boundary (by article id or URL date)."""
     import re
 
     state = load_checkpoint_state(articles_json_path)
@@ -398,9 +398,34 @@ def sync_global_checkpoint_from_sections(articles_json_path: str) -> bool:
     if not sections:
         return False
 
-    best_key: tuple[str, str, str] = ("", "", "")
     best_link = ""
     best_title = ""
+    best_article_id = 0
+    for entry in sections.values():
+        if not isinstance(entry, dict):
+            continue
+        link = entry.get("last_scraped_link") or ""
+        id_match = re.search(r"/article/(\d+)", link)
+        if id_match:
+            aid = int(id_match.group(1))
+            if aid > best_article_id:
+                best_article_id = aid
+                best_link = link
+                best_title = entry.get("last_scraped_title") or ""
+
+    if best_link:
+        update_section_checkpoints(
+            articles_json_path,
+            {},
+            global_newest=(best_link, best_title),
+        )
+        print(
+            f"[INCREMENTAL] Global checkpoint synced from sections: "
+            f"{best_title[:50] or best_link[:70]}"
+        )
+        return True
+
+    best_key: tuple[str, str, str] = ("", "", "")
     for entry in sections.values():
         if not isinstance(entry, dict):
             continue

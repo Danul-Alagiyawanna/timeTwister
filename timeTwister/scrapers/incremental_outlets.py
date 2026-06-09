@@ -732,11 +732,11 @@ def run_virakesari_incremental() -> int:
     from incremental import (
         INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
         INCREMENTAL_RUN_LIMIT_PER_SECTION,
-        apply_section_head_checkpoints,
         get_section_checkpoint,
         migrate_global_checkpoint_to_sections,
         save_replace_only,
         title_for_checkpoint_link,
+        update_section_checkpoints,
     )
     from incremental_runner import create_standard_driver, data_json_path
 
@@ -765,7 +765,7 @@ def run_virakesari_incremental() -> int:
 
     driver = create_standard_driver(use_undetected=True)
     new_articles: list[dict[str, Any]] = []
-    seen_ids: set[int] = set()
+    saved_ids: set[int] = set()
     section_links: dict[str, list[str]] = {}
     section_checkpoint_updates: dict[str, tuple[str, str]] = {}
 
@@ -814,10 +814,10 @@ def run_virakesari_incremental() -> int:
                 if cp_id and link_id and link_id < cp_id:
                     print("  [STOP] Passed checkpoint (older article on list)")
                     break
-                if link_id in seen_ids:
+                if link_id in saved_ids:
                     continue
 
-                print(f"\n[INFO] New {i}: id {link_id}...")
+                print(f"\n[INFO] New {i} ({name}): id {link_id}...")
                 try:
                     row = fetch_article(driver, link)
                     if row:
@@ -828,8 +828,9 @@ def run_virakesari_incremental() -> int:
                         if not title and not summary:
                             print(f"[SKIP] Empty row (no title/body): {link[:80]}...")
                             continue
+                        row["section"] = name
                         new_articles.append(row)
-                        seen_ids.add(link_id)
+                        saved_ids.add(link_id)
                         page_new += 1
                         if first_new_link is None:
                             first_new_link = link
@@ -856,30 +857,8 @@ def run_virakesari_incremental() -> int:
             elif hit_checkpoint and sec_ckpt:
                 section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
             elif sec_ckpt:
-                section_checkpoint_updates[name] = (
-                    sec_ckpt,
-                    title_for_checkpoint_link(
-                        sec_ckpt,
-                        new_articles,
-                        json_path,
-                        section_checkpoint_link=sec_ckpt,
-                        section_checkpoint_title=sec_ckpt_title,
-                    ),
-                )
-            elif links:
-                head = links[0]
-                section_checkpoint_updates[name] = (
-                    head,
-                    title_for_checkpoint_link(head, new_articles, json_path),
-                )
+                section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
 
-        apply_section_head_checkpoints(
-            json_path,
-            section_links,
-            new_articles,
-            section_keys=section_keys,
-            section_updates=section_checkpoint_updates,
-        )
     finally:
         driver.quit()
 
@@ -890,6 +869,25 @@ def run_virakesari_incremental() -> int:
         or (a.get("summary") or a.get("description") or "").strip()
     ]
     print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
+
+    if section_checkpoint_updates:
+        global_link = ""
+        global_title = ""
+        global_id = 0
+        for _name, (link, title) in section_checkpoint_updates.items():
+            aid = virakesari_article_id(link)
+            if aid > global_id:
+                global_id = aid
+                global_link = link
+                global_title = title
+        update_section_checkpoints(
+            json_path,
+            section_checkpoint_updates,
+            global_newest=(global_link, global_title) if global_link else None,
+        )
+        for sec_name, (url, _) in section_checkpoint_updates.items():
+            print(f"  [CKPT] {sec_name}: {url[:70]}")
+
     save_replace_only(json_path, new_articles)
     print("[INCREMENTAL] Virakesari finished.")
     return len(new_articles)

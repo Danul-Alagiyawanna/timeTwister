@@ -226,7 +226,14 @@ def virakesari_article_id(link: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+_VIRAKESARI_MAIN_SELECTORS = (
+    "section.group-news div.article-landing a.news-item",
+    "section.group-news div.three-grid a.news-item",
+)
+
+
 def collect_virakesari_links(driver: Any, url: str) -> list[str]:
+    """Main category grid only — excludes sidebar promos from other sections."""
     sep = "&" if "?" in url else "?"
     page_url = url if "page=" in url else f"{url}{sep}page=1"
     _navigate(driver, page_url, 5)
@@ -247,7 +254,13 @@ def collect_virakesari_links(driver: Any, url: str) -> list[str]:
     soup = BeautifulSoup(driver.page_source, "html.parser")
     links: list[str] = []
     seen_ids: set[int] = set()
-    for card in soup.find_all("a", class_="news-item"):
+    cards: list = []
+    for selector in _VIRAKESARI_MAIN_SELECTORS:
+        cards.extend(soup.select(selector))
+    if not cards:
+        cards = soup.find_all("a", class_="news-item")
+        print("[WARN] Virakesari main grid not found — falling back to all news-item links")
+    for card in cards:
         href = (card.get("href") or "").strip()
         if not href:
             continue
@@ -261,7 +274,10 @@ def collect_virakesari_links(driver: Any, url: str) -> list[str]:
     links.sort(key=virakesari_article_id, reverse=True)
     if links:
         ids = [virakesari_article_id(u) for u in links[:3]]
-        print(f"[INFO] Virakesari list ids (newest-first): {ids[0]}..{ids[-1]} ({len(links)} links)")
+        print(
+            f"[INFO] Virakesari main-grid ids (newest-first): "
+            f"{ids[0]}..{ids[-1]} ({len(links)} links)"
+        )
     return links
 
 
