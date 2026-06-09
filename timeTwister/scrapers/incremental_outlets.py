@@ -904,7 +904,16 @@ def run_virakesari_incremental() -> int:
 
 
 def run_thinakaran_incremental() -> int:
-    """Thinakaran-only incremental loop (isolated from shared per-section runner)."""
+    """Thinakaran incremental — RSS on GHA (Cloudflare), Selenium locally."""
+    import os
+
+    if os.getenv("CI", "").lower() in ("1", "true", "yes"):
+        return _run_thinakaran_incremental_rss()
+    return _run_thinakaran_incremental_selenium()
+
+
+def _run_thinakaran_incremental_rss() -> int:
+    """Per-section RSS feeds via curl_cffi — no Selenium on GHA."""
     from incremental import (
         INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
         INCREMENTAL_RUN_LIMIT_PER_SECTION,
@@ -921,7 +930,7 @@ def run_thinakaran_incremental() -> int:
     mod = _import_scraper("thinakaran_selenium_json")
     pages = [
         (c, f"https://www.thinakaran.lk/category/{c}/")
-        for c in ("local", "politics", "features", "editorial", "sports", "business")
+        for c in mod.THINAKARAN_SECTIONS
     ]
     json_path = data_json_path("thinakaran_latest_news.json")
     section_keys = [name for name, _ in pages]
@@ -933,7 +942,142 @@ def run_thinakaran_incremental() -> int:
         else INCREMENTAL_RUN_LIMIT_PER_SECTION
     )
 
-    print("[INCREMENTAL] Thinakaran — per-section checkpoints (isolated runner)")
+    print("[INCREMENTAL] Thinakaran — RSS per-section (GHA, no Selenium)")
+    if bootstrap:
+        print(f"[INCREMENTAL] No section checkpoint; bootstrap max {max_articles} per section")
+    else:
+        print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles per section")
+
+    section_feed: dict[str, list[dict]] = {}
+    for name, _ in pages:
+        items = mod.fetch_thinakaran_section_feed(name)
+        section_feed[name] = items
+        print(f"[PHASE 1] {name}: {len(items)} article(s) from RSS")
+
+    if sum(len(v) for v in section_feed.values()) == 0:
+        print("[ERROR] All Thinakaran RSS feeds empty — keeping data unchanged")
+        return 0
+
+    new_articles: list[dict[str, Any]] = []
+    saved_urls: set[str] = set()
+    section_checkpoint_updates: dict[str, tuple[str, str]] = {}
+
+    print("\n[INCREMENTAL] Phase 2 — new articles per section")
+    for name, _ in pages:
+        items = section_feed.get(name, [])
+        if not items:
+            print(f"  [SKIP] {name} — empty RSS feed")
+            continue
+
+        sec_ckpt, sec_ckpt_title = get_section_checkpoint(json_path, name)
+        sec_ckpt_norm = normalize_link(sec_ckpt or "")
+        print(f"\n[PHASE 2] {name} — checkpoint: {(sec_ckpt or 'None')[:70]}")
+
+        head_link = normalize_link(items[0].get("link", ""))
+        if sec_ckpt_norm and head_link == sec_ckpt_norm:
+            print(f"  [CAUGHT UP] {name} — RSS head matches checkpoint")
+            section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
+            continue
+
+        page_new = 0
+        first_new_link: str | None = None
+        hit_checkpoint = False
+
+        for i, art in enumerate(items, 1):
+            link = art.get("link", "")
+            norm = normalize_link(link)
+            if sec_ckpt_norm and norm == sec_ckpt_norm:
+                print("  [STOP] Reached section checkpoint")
+                hit_checkpoint = True
+                break
+            if norm in saved_urls:
+                continue
+
+            title = (art.get("title") or "").strip()
+            summary = (
+                (art.get("summary") or art.get("description") or "")
+            ).strip()
+            if not title and not summary:
+                print(f"  [SKIP] Empty RSS row: {link[:80]}...")
+                continue
+
+            print(f"\n[INFO] New {i} ({name}): {link[:80]}...")
+            row = dict(art)
+            row["section"] = name
+            new_articles.append(row)
+            saved_urls.add(norm)
+            page_new += 1
+            if first_new_link is None:
+                first_new_link = link
+
+            if page_new >= max_articles:
+                label = "Bootstrap" if bootstrap else "Run safety"
+                print(
+                    f"[INCREMENTAL] {label} limit ({max_articles}) "
+                    f"for {name} — next section"
+                )
+                break
+
+        if page_new > 0 and first_new_link:
+            section_checkpoint_updates[name] = (
+                first_new_link,
+                title_for_checkpoint_link(
+                    first_new_link, new_articles, json_path
+                ),
+            )
+        elif hit_checkpoint and sec_ckpt:
+            section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
+
+    new_articles = [
+        a
+        for a in new_articles
+        if (a.get("title") or "").strip()
+        or (a.get("summary") or a.get("description") or "").strip()
+    ]
+    print(f"\n[INCREMENTAL] New articles this run: {len(new_articles)}")
+
+    if section_checkpoint_updates:
+        update_section_checkpoints(json_path, section_checkpoint_updates)
+        sync_global_checkpoint_from_sections(json_path)
+        for sec_name, (url, _) in section_checkpoint_updates.items():
+            print(f"  [CKPT] {sec_name}: {url[:70]}")
+
+    save_replace_only(json_path, new_articles)
+    print("[INCREMENTAL] Thinakaran finished.")
+    return len(new_articles)
+
+
+def _run_thinakaran_incremental_selenium() -> int:
+    """Thinakaran Selenium incremental (local / non-CI)."""
+    from incremental import (
+        INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
+        INCREMENTAL_RUN_LIMIT_PER_SECTION,
+        get_section_checkpoint,
+        migrate_global_checkpoint_to_sections,
+        normalize_link,
+        save_replace_only,
+        sync_global_checkpoint_from_sections,
+        title_for_checkpoint_link,
+        update_section_checkpoints,
+    )
+    from incremental_runner import data_json_path
+
+    mod = _import_scraper("thinakaran_selenium_json")
+    pages = [
+        (c, f"https://www.thinakaran.lk/category/{c}/")
+        for c in mod.THINAKARAN_SECTIONS
+    ]
+    json_path = data_json_path("thinakaran_latest_news.json")
+    section_keys = [name for name, _ in pages]
+    migrate_global_checkpoint_to_sections(json_path, section_keys)
+    bootstrap = not any(get_section_checkpoint(json_path, k)[0] for k in section_keys)
+    max_articles = (
+        INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION
+        if bootstrap
+        else INCREMENTAL_RUN_LIMIT_PER_SECTION
+    )
+
+    print("[INCREMENTAL] Thinakaran — Selenium per-section (local)")
     if bootstrap:
         print(f"[INCREMENTAL] No section checkpoint; bootstrap max {max_articles} per section")
     else:

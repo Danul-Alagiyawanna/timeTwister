@@ -28,6 +28,19 @@ from selenium.webdriver.support import expected_conditions as EC
 import re
 
 BASE_URL = "https://www.thinakaran.lk/category/local/"
+THINAKARAN_SECTIONS = (
+    "local",
+    "politics",
+    "features",
+    "editorial",
+    "sports",
+    "business",
+)
+_THINAKARAN_ARTICLE_RE = re.compile(
+    r"https?://(?:www\.)?thinakaran\.lk/\d{4}/\d{2}/\d{2}/",
+    re.I,
+)
+
 
 class TimeoutError(Exception):
     """Custom timeout exception for extraction"""
@@ -514,12 +527,153 @@ def process_articles_from_page(driver, list_url, start_date, end_date):
     return articles_found, articles_in_range, articles_outside_range
 
 
+def _thinakaran_http_get(url: str):
+    """curl_cffi first (GHA Cloudflare), then requests."""
+    import requests as req
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        "Accept-Language": "en-US,en;q=0.9,si;q=0.8",
+        "Referer": "https://www.thinakaran.lk/",
+    }
+    cf_import_error = None
+    for profile in ("chrome124", "chrome120", "safari17_0", "firefox133"):
+        try:
+            from curl_cffi import requests as cf_req  # type: ignore
+
+            r = cf_req.get(
+                url, impersonate=profile, timeout=25, headers=headers
+            )
+            if r.status_code == 200 and len(r.text) > 200:
+                print(f"[INFO] curl_cffi ({profile}) OK for {url}")
+                return r
+            print(f"[WARN] curl_cffi ({profile}) {r.status_code} for {url}")
+        except ImportError as e:
+            cf_import_error = e
+            break
+        except Exception as e:
+            print(f"[WARN] curl_cffi ({profile}): {e}")
+
+    if cf_import_error:
+        print(f"[WARN] curl_cffi not installed: {cf_import_error}")
+
+    try:
+        r = req.get(url, timeout=20, allow_redirects=True, headers=headers)
+        if r.status_code == 200 and len(r.text) > 200:
+            return r
+        print(f"[WARN] requests {r.status_code} for {url}")
+    except Exception as e:
+        print(f"[WARN] requests failed: {e}")
+    return None
+
+
+def _is_thinakaran_article_url(link: str) -> bool:
+    return bool(link and _THINAKARAN_ARTICLE_RE.search(link))
+
+
+def _html_to_plain(html: str) -> str:
+    if not html:
+        return ""
+    try:
+        return BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
+    except Exception:
+        return html.strip()
+
+
+def _parse_thinakaran_rss(xml_text: str) -> list[dict]:
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    ns = {
+        "content": "http://purl.org/rss/1.0/modules/content/",
+        "dc": "http://purl.org/dc/elements/1.1/",
+        "media": "http://search.yahoo.com/mrss/",
+    }
+    articles: list[dict] = []
+    root = ET.fromstring(xml_text)
+    items = root.findall("./channel/item") or root.findall(".//item")
+    for item in items:
+        link = (item.findtext("link") or "").strip()
+        if not _is_thinakaran_article_url(link):
+            continue
+        title = (item.findtext("title") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if pub_date:
+            try:
+                date_str = parsedate_to_datetime(pub_date).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            except Exception:
+                pass
+
+        desc_html = (item.findtext("description") or "").strip()
+        content_el = item.find("content:encoded", ns)
+        content_html = (
+            (content_el.text or "").strip() if content_el is not None else ""
+        )
+        body_text = _html_to_plain(content_html) or _html_to_plain(desc_html)
+
+        image_url = ""
+        thumb = item.find("media:thumbnail", ns)
+        if thumb is not None and thumb.get("url"):
+            image_url = thumb.get("url", "").strip()
+        if not image_url:
+            for html in (content_html, desc_html):
+                if not html:
+                    continue
+                img = BeautifulSoup(html, "html.parser").find("img")
+                if img and img.get("src"):
+                    image_url = img["src"].strip()
+                    break
+
+        articles.append(
+            {
+                "title": title,
+                "link": link.split("?")[0],
+                "summary": body_text,
+                "description": body_text,
+                "date": date_str,
+                "image_url": image_url,
+                "date_source": f"RSS: {date_str}",
+            }
+        )
+    return articles
+
+
+def fetch_thinakaran_section_feed(section: str) -> list[dict]:
+    """Category RSS for incremental (bypasses Cloudflare on GHA)."""
+    feed_url = f"https://www.thinakaran.lk/category/{section}/feed/"
+    resp = _thinakaran_http_get(feed_url)
+    if not resp:
+        return []
+    if "just a moment" in resp.text.lower()[:8000]:
+        print(f"[WARN] Cloudflare interstitial on {feed_url}")
+        return []
+    try:
+        items = _parse_thinakaran_rss(resp.text)
+        if items:
+            print(f"[INFO] RSS {section}: {len(items)} article(s)")
+        return items
+    except Exception as e:
+        print(f"[WARN] RSS parse error ({section}): {e}")
+        return []
+
+
 def create_driver(headless=None):
-    """UC-first Chrome; headless on CI (GHA has no display)."""
+    """UC-first Chrome; headed under xvfb on GHA."""
     import os
 
     if headless is None:
-        headless = os.getenv("CI", "").lower() in ("1", "true", "yes")
+        is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
+        has_display = bool(os.getenv("DISPLAY"))
+        headless = is_ci and not has_display
+        if is_ci and has_display:
+            print("[INFO] xvfb DISPLAY detected — using headed UC for Cloudflare")
 
     prefs = {"profile.default_content_setting_values": {"popups": 1}}
 
