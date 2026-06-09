@@ -509,6 +509,14 @@ def collect_divaina_main_links(driver: Any, url: str) -> list[str]:
 
 def collect_thamilan_links(driver: Any, url: str) -> list[str]:
     _navigate(driver, url, 3)
+    try:
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "h2.hidden.font-heading, a[href^='/articles/']")
+            )
+        )
+    except Exception:
+        time.sleep(3)
     links: list[str] = []
     seen: set[str] = set()
     for h2 in driver.find_elements(By.CSS_SELECTOR, "h2.hidden.font-heading"):
@@ -520,4 +528,24 @@ def collect_thamilan_links(driver: Any, url: str) -> list[str]:
                 links.append(href)
         except Exception:
             continue
-    return links
+
+    if links:
+        return links[:40]
+
+    # LOCAL/NORTH sometimes render before h2 cards; fall back to main-grid links.
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    root = soup.select_one("main") or soup.body
+    for a in root.find_all("a", href=True):
+        if a.find_parent(["header", "footer", "nav"]):
+            continue
+        href = (a.get("href") or "").strip()
+        if href.startswith("/articles/"):
+            full = urljoin("https://www.thamilan.lk", href.split("?")[0])
+        elif "/articles/" in href:
+            full = href.split("?")[0]
+        else:
+            continue
+        if full not in seen:
+            seen.add(full)
+            links.append(full)
+    return links[:40]

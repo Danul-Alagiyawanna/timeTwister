@@ -1205,17 +1205,13 @@ def _run_thinakaran_incremental_selenium() -> int:
 
 
 def run_thamilan_incremental() -> int:
-    from incremental import (
-        clear_global_bleed_section_checkpoints,
-        prune_alias_section_keys,
-    )
+    from incremental import prune_alias_section_keys
 
     mod = _import_scraper("thamilan_selenium_json")
     pages = list(mod.CATEGORY_URLS)
     json_path = data_json_path("thamilan_latest_news.json")
     section_keys = [name for name, _ in pages]
     prune_alias_section_keys(json_path, section_keys)
-    clear_global_bleed_section_checkpoints(json_path, section_keys)
 
     def fetch(d, link: str) -> dict | None:
         d.get(link)
