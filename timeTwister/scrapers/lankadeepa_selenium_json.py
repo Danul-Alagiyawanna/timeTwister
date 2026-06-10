@@ -44,6 +44,8 @@ from incremental import (
 )
 from incremental_links import collect_lankadeepa_links
 from incremental_runner import article_from_content, create_standard_driver, data_json_path
+from scrapling_fetch import fetch_text
+from scrapling_page import html_driver
 
 LANKADEEPA_CATEGORIES = [
     ("latest", "https://www.lankadeepa.lk/latest-news/1"),
@@ -1001,9 +1003,18 @@ def main_incremental() -> int:
 
             print(f"\n  [INFO] New {i}: {link[:80]}...")
             try:
-                driver.get(link)
-                time.sleep(2)
-                meta = extract_with_timeout(driver, timeout_seconds=30)
+                meta = None
+                html = fetch_text(link, timeout=30)
+                if html:
+                    meta = extract_with_timeout(html_driver(html, link), timeout_seconds=30)
+                if not meta or (
+                    not meta.get("title")
+                    and not meta.get("description")
+                    and not meta.get("summary")
+                ):
+                    driver.get(link)
+                    time.sleep(2)
+                    meta = extract_with_timeout(driver, timeout_seconds=30)
                 row = article_from_content(meta, link) if meta else None
                 if not row or (
                     not row.get("title")

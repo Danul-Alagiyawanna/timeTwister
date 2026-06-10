@@ -41,6 +41,8 @@ from incremental import (
     update_section_checkpoints,
 )
 from incremental_runner import article_from_content, data_json_path
+from scrapling_fetch import fetch_text
+from scrapling_page import html_driver
 
 DINAMINA_CATEGORIES = [
     ("local", "https://www.dinamina.lk/category/local/"),
@@ -829,46 +831,23 @@ def _link_to_section(link: str) -> str | None:
 
 
 def _http_get(url: str, **kwargs):
-    """curl_cffi first (GHA Cloudflare), then requests."""
+    """Scrapling first, then curl_cffi/requests via shared fetch helper."""
+    from scrapling_fetch import HttpResponse, fetch_bytes
+
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
         "Accept-Language": "en-US,en;q=0.9,si;q=0.8",
         "Referer": "https://www.dinamina.lk/",
     }
-    import requests as req
-
-    cf_import_error = None
-    for profile in ("chrome124", "chrome120", "safari17_0", "firefox133"):
-        try:
-            from curl_cffi import requests as cf_req  # type: ignore
-
-            r = cf_req.get(
-                url, impersonate=profile, timeout=25, headers=headers, **kwargs
-            )
-            if r.status_code == 200 and len(r.text) > 200:
-                print(f"[INFO] curl_cffi ({profile}) OK for {url}")
-                return r
-            print(f"[WARN] curl_cffi ({profile}) {r.status_code} for {url}")
-        except ImportError as e:
-            cf_import_error = e
-            break
-        except Exception as e:
-            print(f"[WARN] curl_cffi ({profile}): {e}")
-
-    if cf_import_error:
-        print(f"[WARN] curl_cffi not installed: {cf_import_error}")
-
-    try:
-        r = req.get(url, timeout=20, allow_redirects=True, headers=headers, **kwargs)
-        if r.status_code == 200 and len(r.text) > 200:
-            return r
-        print(f"[WARN] requests {r.status_code} for {url}")
-    except Exception as e:
-        print(f"[WARN] requests failed: {e}")
+    raw = fetch_bytes(
+        url,
+        accept=headers["Accept"],
+        timeout=25,
+        expect_xml=True,
+        extra_headers=headers,
+    )
+    if raw and len(raw) > 200:
+        return HttpResponse(raw)
     return None
 
 
@@ -1278,9 +1257,18 @@ def main_incremental_selenium() -> int:
 
             print(f"\n  [INFO] New {i}: {link[:80]}...")
             try:
-                driver.get(link)
-                time.sleep(2)
-                meta = extract_with_timeout(driver, timeout_seconds=30)
+                meta = None
+                html = fetch_text(link, timeout=30)
+                if html:
+                    meta = extract_with_timeout(html_driver(html, link), timeout_seconds=30)
+                if not meta or (
+                    not meta.get("title")
+                    and not meta.get("description")
+                    and not meta.get("summary")
+                ):
+                    driver.get(link)
+                    time.sleep(2)
+                    meta = extract_with_timeout(driver, timeout_seconds=30)
                 row = article_from_content(meta, link) if meta else None
                 if not row or (
                     not row.get("title")

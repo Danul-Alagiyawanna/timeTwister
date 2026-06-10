@@ -333,6 +333,20 @@ def _create_driver():
     return driver
 
 
+def _fetch_island_article(link: str, driver):
+    from scrapling_fetch import fetch_text
+    from scrapling_page import html_driver
+
+    html = fetch_text(link, timeout=30)
+    if html:
+        metadata = extract_article_metadata(html_driver(html, link))
+        if metadata and (metadata.get("title") or metadata.get("description")):
+            return metadata
+    driver.get(link)
+    time.sleep(2)
+    return extract_article_metadata(driver)
+
+
 def main_incremental():
     """Per-section checkpoints — each category page tracks its own newest article."""
     json_filename = _data_json_path()
@@ -358,9 +372,17 @@ def main_incremental():
     for name, url in ISLAND_CATEGORIES:
         print(f"\n[PHASE 1] {name}: {url}")
         try:
-            driver.get(url)
-            time.sleep(3)
-            links = get_main_article_links(driver, preserve_order=True)
+            from scrapling_fetch import fetch_text
+            from scrapling_page import html_driver
+
+            links = []
+            html = fetch_text(url, timeout=25)
+            if html:
+                links = get_main_article_links(html_driver(html, url), preserve_order=True)
+            if not links:
+                driver.get(url)
+                time.sleep(3)
+                links = get_main_article_links(driver, preserve_order=True)
             section_links[name] = links
             print(f"  {len(links)} links")
         except Exception as e:
@@ -390,9 +412,7 @@ def main_incremental():
 
             print(f"\n  [INFO] New {i}: {link[:80]}...")
             try:
-                driver.get(link)
-                time.sleep(2)
-                metadata = extract_article_metadata(driver)
+                metadata = _fetch_island_article(link, driver)
                 article_date = metadata["date_published"]
                 standardized_date = (
                     article_date.strftime("%Y-%m-%d %H:%M:%S")

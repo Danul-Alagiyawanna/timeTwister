@@ -42,7 +42,26 @@ def _import_scraper(module_name: str):
     return importlib.import_module(module_name)
 
 
+def _scrapling_html_driver(link: str, timeout: int = 25):
+    from scrapling_fetch import fetch_text
+    from scrapling_page import html_driver
+
+    html = fetch_text(link, timeout=timeout)
+    if html and len(html) > 500:
+        return html_driver(html, link)
+    return None
+
+
 def _fetch_metadata(driver, link: str, mod: Any, use_timeout: bool = False) -> dict | None:
+    page = _scrapling_html_driver(link)
+    if page:
+        if use_timeout:
+            meta = mod.extract_with_timeout(page)
+        else:
+            meta = mod.extract_article_metadata(page)
+        if meta and (meta.get("title") or meta.get("description")):
+            return article_from_metadata(meta, link)
+
     driver.get(link)
     time.sleep(2)
     if use_timeout:
@@ -55,6 +74,12 @@ def _fetch_metadata(driver, link: str, mod: Any, use_timeout: bool = False) -> d
 
 
 def _fetch_content(driver, link: str, mod: Any) -> dict | None:
+    page = _scrapling_html_driver(link)
+    if page:
+        meta = mod.extract_with_timeout(page)
+        if meta and (meta.get("title") or meta.get("description") or meta.get("summary")):
+            return article_from_content(meta, link)
+
     driver.get(link)
     time.sleep(2)
     meta = mod.extract_with_timeout(driver)
@@ -66,16 +91,31 @@ def _fetch_content(driver, link: str, mod: Any) -> dict | None:
 def _fetch_ceylontoday(driver, link: str, mod: Any) -> dict | None:
     from bs4 import BeautifulSoup
 
-    driver.get(link)
-    time.sleep(2)
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+    html = None
+    page = _scrapling_html_driver(link)
+    if page:
+        html = page.page_source
+        soup = BeautifulSoup(html, "html.parser")
+    else:
+        driver.get(link)
+        time.sleep(2)
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+
     title_el = soup.select_one("h1.entry-title") or soup.find("h1")
     title = title_el.get_text(strip=True) if title_el else ""
     date_tag = soup.find("time", class_="entry-date") or soup.find("meta", property="article:published_time")
     date_str = ""
     if date_tag:
         date_str = date_tag.get("datetime") or date_tag.get("content") or date_tag.get_text(strip=True)
-    desc, image_url = mod.get_enhanced_article_description(driver, link)
+
+    if html:
+        desc, image_url = mod.get_enhanced_article_description(page, link, html=html)
+    else:
+        desc, image_url = mod.get_enhanced_article_description(driver, link)
+
+    if not title and not desc:
+        return None
+
     return {
         "title": title,
         "link": link,
@@ -85,6 +125,32 @@ def _fetch_ceylontoday(driver, link: str, mod: Any) -> dict | None:
         "image_url": image_url if image_url not in ("N/A", "", "null") else "",
         "date_source": "Incremental scrape",
     }
+
+
+def _collect_ceylontoday_links_scrapling(url: str) -> list[str]:
+    from bs4 import BeautifulSoup
+    from scrapling_fetch import fetch_text
+
+    html = fetch_text(url, timeout=25)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+    for article in soup.select("div.tdb_module_loop.td_module_wrap"):
+        title_tag = article.select_one("h3.entry-title a")
+        if title_tag and title_tag.get("href"):
+            links.append(title_tag["href"])
+    return links
+
+
+def _collect_list_links_scrapling(url: str, mod: Any) -> list[str]:
+    from scrapling_fetch import fetch_text
+    from scrapling_page import html_driver
+
+    html = fetch_text(url, timeout=25)
+    if not html:
+        return []
+    return mod.get_main_article_links(html_driver(html, url))
 
 
 # --- per-outlet runners ---
@@ -113,6 +179,12 @@ def run_ceylontoday_incremental() -> int:
     pages = [
         (c, f"https://ceylontoday.lk/category/ceylon-today-daily/{c}/") for c in cats
     ]
+
+    def collect(d, url):
+        links = _collect_ceylontoday_links_scrapling(url)
+        if links:
+            return links
+        return collect_ceylontoday_links(d, url)
 
     def fetch(d, link):
         return _fetch_ceylontoday(d, link, mod)
@@ -332,7 +404,7 @@ def run_economynext_incremental() -> int:
 
     from bs4 import BeautifulSoup as BS
 
-    from economynext_scrapling import fetch_bytes
+    from scrapling_fetch import fetch_bytes
     from incremental import (
         INCREMENTAL_BOOTSTRAP_LIMIT,
         INCREMENTAL_RUN_LIMIT,
@@ -607,6 +679,9 @@ def run_sundayobserver_incremental() -> int:
     ]
 
     def collect(d, url):
+        links = _collect_list_links_scrapling(url, mod)
+        if links:
+            return links
         d.get(url)
         time.sleep(3)
         return mod.get_main_article_links(d)

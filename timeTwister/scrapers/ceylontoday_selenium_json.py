@@ -153,30 +153,33 @@ def is_valid_image_url(url):
     
     return any(indicator in url_lower for indicator in image_indicators)
 
-def get_enhanced_article_description(driver, article_url):
+def get_enhanced_article_description(driver, article_url, *, html=None):
     """Enhanced description extraction with multiple fallback strategies."""
     try:
         print(f"  [LINK] Fetching: {article_url}")
-        driver.get(article_url)
-        
-        # Wait for main content with multiple possible selectors
-        selectors_to_wait = [".td-post-content", ".post-content", ".entry-content", "article"]
-        content_loaded = False
-        
-        for selector in selectors_to_wait:
-            try:
-                WebDriverWait(driver, 8).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                )
-                content_loaded = True
-                break
-            except:
-                continue
-        
-        if not content_loaded:
-            print("  [WARNING] Content selectors not found, proceeding anyway...")
-        
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+        else:
+            driver.get(article_url)
+
+            # Wait for main content with multiple possible selectors
+            selectors_to_wait = [".td-post-content", ".post-content", ".entry-content", "article"]
+            content_loaded = False
+
+            for selector in selectors_to_wait:
+                try:
+                    WebDriverWait(driver, 8).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    content_loaded = True
+                    break
+                except Exception:
+                    continue
+
+            if not content_loaded:
+                print("  [WARNING] Content selectors not found, proceeding anyway...")
+
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
         
         # Extract image URL using multiple strategies
         image_url = extract_image_url_strategies(soup, article_url)
