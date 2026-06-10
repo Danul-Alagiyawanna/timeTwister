@@ -382,6 +382,7 @@ def run_economynext_incremental() -> int:
         RSS_FEED,
         accept="application/rss+xml, application/xml, */*",
         timeout=25,
+        expect_xml=True,
     )
     if rss_body:
         rss_xml = rss_body.decode("utf-8", errors="replace")
