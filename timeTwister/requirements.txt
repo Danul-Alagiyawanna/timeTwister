@@ -7,4 +7,5 @@ python-dotenv>=1.0
 google-genai>=0.5
 requests>=2.31
 curl_cffi>=0.7
+scrapling[fetchers]>=0.4.9
 googlenewsdecoder>=0.1.7

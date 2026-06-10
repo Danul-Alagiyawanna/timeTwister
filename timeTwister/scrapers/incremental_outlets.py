@@ -327,11 +327,12 @@ def _repair_economynext_checkpoint(json_path: str) -> None:
 
 
 def run_economynext_incremental() -> int:
-    """economynext.com/feed/ (+ WP API fallback). No Google News — links only, no article body."""
+    """economynext.com/feed/ (+ WP API fallback) via Scrapling HTTP fetcher."""
     import re as _re
 
     from bs4 import BeautifulSoup as BS
 
+    from economynext_scrapling import fetch_bytes
     from incremental import (
         INCREMENTAL_BOOTSTRAP_LIMIT,
         INCREMENTAL_RUN_LIMIT,
@@ -369,115 +370,48 @@ def run_economynext_incremental() -> int:
     if known_keys:
         print(f"[INCREMENTAL] Boundary keys from previous run: {len(known_keys)}")
 
-    print("[INCREMENTAL] EconomyNext - economynext.com/feed/ (+ WP API fallback)")
+    print("[INCREMENTAL] EconomyNext — Scrapling RSS + WP API fallback")
     if bootstrap:
         print(f"[INCREMENTAL] No checkpoint; bootstrap max {max_articles} articles")
     else:
         print(f"[INCREMENTAL] Run safety cap: {max_articles} new articles")
 
-    _BROWSER_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    def _get(url: str, **kw) -> "requests.Response | None":  # type: ignore[name-defined]
-        """curl_cffi first (GHA Cloudflare), then requests."""
-        for profile in ("chrome124", "safari17_0", "firefox133"):
-            try:
-                from curl_cffi import requests as cf_req  # type: ignore
-
-                r = cf_req.get(
-                    url,
-                    impersonate=profile,
-                    timeout=15,
-                    headers=_BROWSER_HEADERS,
-                    **kw,
-                )
-                if r.status_code == 200:
-                    print(f"[INFO] curl_cffi ({profile}) got 200 for {url}")
-                    return r
-                print(f"[WARN] curl_cffi ({profile}) got {r.status_code}")
-            except ImportError:
-                break
-            except Exception as e:
-                print(f"[WARN] curl_cffi ({profile}) failed: {e}")
-        import requests as _req
-
-        try:
-            r = _req.get(
-                url,
-                timeout=15,
-                allow_redirects=True,
-                headers=_BROWSER_HEADERS,
-                **kw,
-            )
-            if r.status_code == 200:
-                return r
-            print(f"[WARN] requests {r.status_code} for {url}")
-        except Exception as e:
-            print(f"[WARN] requests failed: {e}")
-        return None
-
-    # --- source 1: economynext.com/feed/ (authoritative; retry every TLS profile) ---
+    # --- source 1: economynext.com/feed/ ---
     articles_raw: list[dict] = []
-    for attempt, profile in enumerate(
-        ("chrome124", "safari17_0", "firefox133", "chrome124"), start=1
-    ):
-        try:
-            from curl_cffi import requests as cf_req  # type: ignore
-
-            resp = cf_req.get(
-                RSS_FEED,
-                impersonate=profile,
-                timeout=20,
-                headers={**_BROWSER_HEADERS, "Accept": "application/rss+xml, application/xml, */*"},
-            )
-            if resp.status_code == 200 and not _is_cloudflare_block(resp.text):
-                parsed = _parse_economynext_rss_xml(resp.text)
-                if parsed:
-                    articles_raw = parsed
-                    print(
-                        f"[INFO] economynext.com/feed/ OK via curl_cffi ({profile}), "
-                        f"{len(articles_raw)} items (attempt {attempt})"
-                    )
-                    break
-                print(f"[WARN] RSS XML empty/invalid from curl_cffi ({profile})")
-            else:
-                print(
-                    f"[WARN] RSS blocked or bad status from curl_cffi ({profile}): "
-                    f"{getattr(resp, 'status_code', '?')}"
-                )
-        except ImportError:
-            break
-        except Exception as e:
-            print(f"[WARN] RSS curl_cffi ({profile}) attempt {attempt}: {e}")
-
-    if not articles_raw:
-        resp = _get(RSS_FEED)
-        if resp and not _is_cloudflare_block(resp.text):
-            parsed = _parse_economynext_rss_xml(resp.text)
+    rss_body = fetch_bytes(
+        RSS_FEED,
+        accept="application/rss+xml, application/xml, */*",
+        timeout=25,
+    )
+    if rss_body:
+        rss_xml = rss_body.decode("utf-8", errors="replace")
+        if not _is_cloudflare_block(rss_xml):
+            parsed = _parse_economynext_rss_xml(rss_xml)
             if parsed:
                 articles_raw = parsed
-                print(f"[INFO] economynext.com/feed/ OK via requests, {len(articles_raw)} items")
+                print(
+                    f"[INFO] economynext.com/feed/ OK via Scrapling, "
+                    f"{len(articles_raw)} items"
+                )
     if not articles_raw:
         print("[WARN] economynext.com/feed/ unavailable - trying WP API fallback")
 
     # --- source 2: WordPress REST API (fallback when RSS blocked) ---
     if not articles_raw:
         print("[INFO] RSS unavailable — trying WordPress REST API...")
-        resp = _get(WP_API, params={
-            "per_page": 20,
-            "_fields": "id,title,link,date,excerpt,content,jetpack_featured_media_url",
-        })
-        if resp:
+        wp_body = fetch_bytes(
+            WP_API,
+            params={
+                "per_page": 20,
+                "_fields": "id,title,link,date,excerpt,content,jetpack_featured_media_url",
+            },
+            accept="application/json",
+            timeout=25,
+        )
+        if wp_body:
             try:
                 import json as _json
-                posts = _json.loads(resp.text)
+                posts = _json.loads(wp_body.decode("utf-8", errors="replace"))
                 for post in posts:
                     link = post.get("link", "").strip()
                     if not link:
