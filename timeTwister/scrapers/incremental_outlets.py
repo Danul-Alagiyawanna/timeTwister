@@ -73,12 +73,23 @@ def _fetch_metadata(driver, link: str, mod: Any, use_timeout: bool = False) -> d
     return article_from_metadata(meta, link)
 
 
-def _fetch_content(driver, link: str, mod: Any) -> dict | None:
+def _fetch_content(
+    driver,
+    link: str,
+    mod: Any,
+    *,
+    ensure_driver: Callable[[], Any] | None = None,
+) -> dict | None:
     page = _scrapling_html_driver(link)
     if page:
         meta = mod.extract_with_timeout(page)
         if meta and (meta.get("title") or meta.get("description") or meta.get("summary")):
             return article_from_content(meta, link)
+
+    if driver is None and ensure_driver is not None:
+        driver = ensure_driver()
+    if driver is None:
+        return None
 
     driver.get(link)
     time.sleep(2)
@@ -774,18 +785,26 @@ def run_virakesari_incremental() -> int:
             f"[INCREMENTAL] Run safety cap: {max_articles} new articles per section"
         )
 
-    driver = mod.create_driver()
+    driver = None
     new_articles: list[dict[str, Any]] = []
     saved_ids: set[int] = set()
     section_links: dict[str, list[str]] = {}
     section_checkpoint_updates: dict[str, tuple[str, str]] = {}
 
+    def _ensure_driver():
+        nonlocal driver
+        if driver is None:
+            driver = mod.create_driver()
+        return driver
+
     try:
-        print("\n[INCREMENTAL] Phase 1 — list pages")
+        print("\n[INCREMENTAL] Phase 1 — list pages (Scrapling first)")
         for name, page_url in pages:
             print(f"\n{'=' * 50}\n[INCREMENTAL] Virakesari / {name}\n{page_url}")
             try:
-                links = collect_virakesari_links(driver, page_url)
+                links = collect_virakesari_links(None, page_url)
+                if not links:
+                    links = collect_virakesari_links(_ensure_driver(), page_url)
                 section_links[name] = links
                 print(f"[INFO] {len(links)} links on list page")
             except Exception as e:
@@ -801,8 +820,10 @@ def run_virakesari_incremental() -> int:
             )
             return 0
 
-        print("\n[INCREMENTAL] Phase 2 — fetch new articles per section")
-        fetch_article = lambda d, l: _fetch_content(d, l, mod)
+        print("\n[INCREMENTAL] Phase 2 — fetch new articles per section (Scrapling first)")
+        fetch_article = lambda d, l: _fetch_content(
+            None, l, mod, ensure_driver=_ensure_driver
+        )
 
         for name, _page_url in pages:
             links = section_links.get(name, [])
@@ -880,7 +901,8 @@ def run_virakesari_incremental() -> int:
                 section_checkpoint_updates[name] = (sec_ckpt, sec_ckpt_title)
 
     finally:
-        driver.quit()
+        if driver is not None:
+            driver.quit()
 
     new_articles = [
         a

@@ -240,6 +240,15 @@ def _virakesari_page_ready(driver: Any) -> bool:
     return "/article/" in src or "news-item" in src
 
 
+def _virakesari_html_ready(html: str) -> bool:
+    if not html or len(html) < 500:
+        return False
+    lower = html.lower()
+    if "just a moment" in lower[:2000] or "checking your browser" in lower[:8000]:
+        return False
+    return "/article/" in lower or "news-item" in lower
+
+
 def _collect_virakesari_hrefs(driver: Any, *, main_grid_only: bool) -> list[str]:
     selectors = list(_VIRAKESARI_MAIN_SELECTORS) if main_grid_only else ["a.news-item"]
     hrefs: list[str] = []
@@ -256,9 +265,99 @@ def _collect_virakesari_hrefs(driver: Any, *, main_grid_only: bool) -> list[str]
     return hrefs
 
 
-def collect_virakesari_links(driver: Any, url: str) -> list[str]:
+def _parse_virakesari_hrefs_from_html(html: str, *, main_grid_only: bool = True) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    cards: list = []
+    if main_grid_only:
+        for selector in _VIRAKESARI_MAIN_SELECTORS:
+            cards.extend(soup.select(selector))
+        if not cards:
+            return _parse_virakesari_hrefs_from_html(html, main_grid_only=False)
+    else:
+        cards = soup.find_all("a", class_="news-item")
+        if cards:
+            print("[WARN] Virakesari DOM fallback: all news-item links")
+    hrefs: list[str] = []
+    for card in cards:
+        href = (card.get("href") or "").strip()
+        if href:
+            hrefs.append(href)
+    return hrefs
+
+
+def _finalize_virakesari_links(raw_hrefs: list[str]) -> list[str]:
+    links: list[str] = []
+    seen_ids: set[int] = set()
+    for href in raw_hrefs:
+        if not href.startswith("http"):
+            href = "https://www.virakesari.lk" + href
+        aid = virakesari_article_id(href)
+        if not aid or aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        links.append(href.split("?")[0])
+    links.sort(key=virakesari_article_id, reverse=True)
+    return links
+
+
+def _log_virakesari_links(links: list[str], *, source: str, driver: Any | None = None) -> None:
+    if links:
+        ids = [virakesari_article_id(u) for u in links[:3]]
+        print(
+            f"[INFO] Virakesari main-grid ids (newest-first, {source}): "
+            f"{ids[0]}..{ids[-1]} ({len(links)} links)"
+        )
+        return
+    if driver is not None:
+        print(
+            f"[ERROR] Virakesari list empty — title={driver.title!r} "
+            f"src={len(driver.page_source or '')} bytes"
+        )
+    else:
+        print("[ERROR] Virakesari list empty — Scrapling returned no links")
+
+
+def _collect_virakesari_links_scrapling(url: str) -> list[str]:
+    import os
+
+    from scrapling_fetch import fetch_text
+
+    is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
+    sep = "&" if "?" in url else "?"
+    page_url = url if "page=" in url else f"{url}{sep}page=1"
+    headers = {"Referer": "https://www.virakesari.lk/"}
+    timeout = 45 if is_ci else 25
+
+    for attempt in range(1, 4):
+        html = fetch_text(page_url, timeout=timeout, extra_headers=headers)
+        if not html or not _virakesari_html_ready(html):
+            print(
+                f"[WARN] Virakesari Scrapling attempt {attempt}/3 — "
+                f"no ready HTML ({len(html or '')} bytes)"
+            )
+            if attempt < 3:
+                time.sleep(6)
+            continue
+        raw_hrefs = _parse_virakesari_hrefs_from_html(html, main_grid_only=True)
+        links = _finalize_virakesari_links(raw_hrefs)
+        if links:
+            _log_virakesari_links(links, source="Scrapling")
+            return links
+        print(f"[WARN] Virakesari Scrapling attempt {attempt}/3 — parsed 0 links")
+        if attempt < 3:
+            time.sleep(6)
+    return []
+
+
+def collect_virakesari_links(driver: Any | None, url: str) -> list[str]:
     """Main category grid only — excludes sidebar promos from other sections."""
     import os
+
+    links = _collect_virakesari_links_scrapling(url)
+    if links:
+        return links
+    if driver is None:
+        return []
 
     is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
     sep = "&" if "?" in url else "?"
@@ -297,50 +396,13 @@ def collect_virakesari_links(driver: Any, url: str) -> list[str]:
         if attempt < 3:
             time.sleep(6)
 
-    links: list[str] = []
-    seen_ids: set[int] = set()
-    for href in raw_hrefs:
-        if not href.startswith("http"):
-            href = "https://www.virakesari.lk" + href
-        aid = virakesari_article_id(href)
-        if not aid or aid in seen_ids:
-            continue
-        seen_ids.add(aid)
-        links.append(href.split("?")[0])
-
+    links = _finalize_virakesari_links(raw_hrefs)
     if not links:
-        soup = BeautifulSoup(driver.page_source or "", "html.parser")
-        cards: list = []
-        for selector in _VIRAKESARI_MAIN_SELECTORS:
-            cards.extend(soup.select(selector))
-        if not cards:
-            cards = soup.find_all("a", class_="news-item")
-            if cards:
-                print("[WARN] Virakesari DOM fallback: all news-item links")
-        for card in cards:
-            href = (card.get("href") or "").strip()
-            if not href:
-                continue
-            if not href.startswith("http"):
-                href = "https://www.virakesari.lk" + href
-            aid = virakesari_article_id(href)
-            if not aid or aid in seen_ids:
-                continue
-            seen_ids.add(aid)
-            links.append(href.split("?")[0])
+        links = _finalize_virakesari_links(
+            _parse_virakesari_hrefs_from_html(driver.page_source or "", main_grid_only=True)
+        )
 
-    links.sort(key=virakesari_article_id, reverse=True)
-    if links:
-        ids = [virakesari_article_id(u) for u in links[:3]]
-        print(
-            f"[INFO] Virakesari main-grid ids (newest-first): "
-            f"{ids[0]}..{ids[-1]} ({len(links)} links)"
-        )
-    else:
-        print(
-            f"[ERROR] Virakesari list empty — title={driver.title!r} "
-            f"src={len(driver.page_source or '')} bytes"
-        )
+    _log_virakesari_links(links, source="Selenium", driver=driver)
     return links
 
 
