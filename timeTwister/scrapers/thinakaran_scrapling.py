@@ -4,6 +4,7 @@ RSS + HTML list/article fetch with curl_cffi GHA fallback.
 """
 from __future__ import annotations
 
+import html as html_module
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -82,6 +83,68 @@ def _html_to_plain(html: str) -> str:
         return BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
     except Exception:
         return html.strip()
+
+
+_RSS_BOILERPLATE_CUT = re.compile(
+    r"(?:𝗙𝗢𝗟𝗟𝗢𝗪 𝗨𝗦 𝗢𝗡|FOLLOW US ON|Thinakaran-WhatsApp-Channel|"
+    r"The post .+ appeared first on )",
+    re.I | re.S,
+)
+_RSS_HTML_CUT = re.compile(
+    r'<a[^>]+href=["\']https?://(?:www\.)?whatsapp\.com/channel|'
+    r'class=["\'][^"\']*pdfemb-viewer|Thinakaran-WhatsApp-Channel',
+    re.I,
+)
+_JUNK_IMG_MARKERS = (
+    "thinakaran-whatsapp-channel",
+    "whatsapp-channel",
+    "pdfemb",
+    "favicon",
+)
+
+
+def _trim_rss_html(html: str) -> str:
+    if not html:
+        return ""
+    m = _RSS_HTML_CUT.search(html)
+    return html[: m.start()] if m else html
+
+
+def _strip_rss_boilerplate(text: str) -> str:
+    if not text:
+        return ""
+    parts = _RSS_BOILERPLATE_CUT.split(text, maxsplit=1)
+    return parts[0].strip()
+
+
+def _rss_html_to_plain(html: str) -> str:
+    trimmed = _trim_rss_html(html)
+    plain = _html_to_plain(trimmed)
+    return _strip_rss_boilerplate(plain)
+
+
+def _first_article_image(html: str) -> str:
+    if not html:
+        return ""
+    trimmed = _trim_rss_html(html)
+    try:
+        soup = BeautifulSoup(trimmed, "html.parser")
+    except Exception:
+        return ""
+    for img in soup.find_all("img"):
+        src = (img.get("src") or img.get("data-src") or "").strip()
+        if not src.startswith("http"):
+            continue
+        lower = src.lower()
+        if any(marker in lower for marker in _JUNK_IMG_MARKERS):
+            continue
+        return src
+    return ""
+
+
+def _normalize_rss_link(link: str) -> str:
+    link = (link or "").strip().split("?")[0].split("#")[0]
+    return link.rstrip("/") + "/" if link else ""
 
 
 def parse_list_links_from_html(html: str) -> list[str]:
@@ -277,6 +340,7 @@ def fetch_article_content(url: str, *, timeout: int = 30) -> dict[str, Any] | No
 
 
 def parse_rss(xml_text: str) -> list[dict[str, Any]]:
+    """Parse Thinakaran WordPress RSS (content:encoded + category feeds)."""
     ns = {
         "content": "http://purl.org/rss/1.0/modules/content/",
         "dc": "http://purl.org/dc/elements/1.1/",
@@ -286,10 +350,11 @@ def parse_rss(xml_text: str) -> list[dict[str, Any]]:
     root = ET.fromstring(xml_text)
     items = root.findall("./channel/item") or root.findall(".//item")
     for item in items:
-        link = (item.findtext("link") or "").strip()
+        link = _normalize_rss_link(item.findtext("link") or "")
         if not is_article_url(link):
             continue
-        title = (item.findtext("title") or "").strip()
+
+        title = html_module.unescape((item.findtext("title") or "").strip())
         pub_date = (item.findtext("pubDate") or "").strip()
         date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if pub_date:
@@ -301,32 +366,51 @@ def parse_rss(xml_text: str) -> list[dict[str, Any]]:
         desc_html = (item.findtext("description") or "").strip()
         content_el = item.find("content:encoded", ns)
         content_html = (content_el.text or "").strip() if content_el is not None else ""
-        body_text = _html_to_plain(content_html) or _html_to_plain(desc_html)
+        body_text = _rss_html_to_plain(content_html) or _rss_html_to_plain(desc_html)
 
         image_url = ""
         thumb = item.find("media:thumbnail", ns)
         if thumb is not None and thumb.get("url"):
             image_url = thumb.get("url", "").strip()
+        enclosure = item.find("enclosure")
+        if (
+            not image_url
+            and enclosure is not None
+            and (enclosure.get("type") or "").startswith("image")
+        ):
+            image_url = (enclosure.get("url") or "").strip()
         if not image_url:
-            for html in (content_html, desc_html):
-                if not html:
-                    continue
-                img = BeautifulSoup(html, "html.parser").find("img")
-                if img and img.get("src"):
-                    image_url = img["src"].strip()
-                    break
+            image_url = _first_article_image(content_html) or _first_article_image(
+                desc_html
+            )
 
-        articles.append(
-            {
-                "title": title,
-                "link": link.split("?")[0],
-                "summary": body_text,
-                "description": body_text,
-                "date": date_str,
-                "image_url": image_url,
-                "date_source": f"RSS: {date_str}",
-            }
+        author_el = item.find("dc:creator", ns)
+        author = html_module.unescape(
+            (author_el.text or "").strip() if author_el is not None else ""
         )
+        categories = [
+            html_module.unescape((c.text or "").strip())
+            for c in item.findall("category")
+            if (c.text or "").strip()
+        ]
+        guid = (item.findtext("guid") or "").strip()
+
+        row: dict[str, Any] = {
+            "title": title,
+            "link": link,
+            "summary": body_text,
+            "description": body_text,
+            "date": date_str,
+            "image_url": image_url,
+            "date_source": f"RSS: {date_str}",
+        }
+        if author:
+            row["author"] = author
+        if categories:
+            row["rss_categories"] = categories
+        if guid:
+            row["guid"] = guid
+        articles.append(row)
     return articles
 
 
