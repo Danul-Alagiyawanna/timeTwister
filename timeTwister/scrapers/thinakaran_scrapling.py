@@ -5,6 +5,7 @@ RSS + HTML list/article fetch with curl_cffi GHA fallback.
 from __future__ import annotations
 
 import html as html_module
+import json
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -27,6 +28,17 @@ _RSS_ACCEPT = "application/rss+xml, application/xml, text/xml, */*"
 BASE_URL = "https://www.thinakaran.lk"
 _HEADERS = {"Referer": f"{BASE_URL}/"}
 _RSS_HEADERS = {**_HEADERS, "Accept": _RSS_ACCEPT}
+_JSON_HEADERS = {**_HEADERS, "Accept": "application/json"}
+_WP_POST_FIELDS = "id,title,link,date,excerpt,content,jetpack_featured_media_url"
+# Site URL path `features` maps to WP category slug `featured`
+_SECTION_WP_SLUG: dict[str, str] = {
+    "local": "local",
+    "politics": "politics",
+    "features": "featured",
+    "editorial": "editorial",
+    "sports": "sports",
+    "business": "business",
+}
 
 
 def _html_stealth_kw() -> dict[str, bool]:
@@ -200,6 +212,150 @@ def parse_list_cards_from_html(html: str) -> list[dict[str, Any]]:
             }
         )
     return cards
+
+
+def _fetch_wp_json(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: int = 30,
+) -> Any | None:
+    raw = fetch_bytes(
+        url,
+        params=params,
+        accept="application/json",
+        timeout=timeout,
+        expect_json=True,
+        extra_headers=_JSON_HEADERS,
+    )
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        print(f"[WARN] WP-API JSON parse error for {url[:70]}: {e}")
+        return None
+
+
+def _wp_rendered_text(field: Any) -> str:
+    if isinstance(field, dict):
+        html = field.get("rendered") or ""
+    else:
+        html = str(field or "")
+    if not html:
+        return ""
+    return html_module.unescape(
+        BeautifulSoup(html, "html.parser").get_text(strip=True)
+    )
+
+
+def _wp_post_to_article(post: dict[str, Any]) -> dict[str, Any] | None:
+    link = _normalize_rss_link(post.get("link") or "")
+    if not is_article_url(link):
+        return None
+
+    title = _wp_rendered_text(post.get("title"))
+    date_raw = (post.get("date") or "").strip()
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if date_raw:
+        try:
+            date_str = datetime.fromisoformat(date_raw).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+
+    content_html = (post.get("content") or {}).get("rendered", "")
+    if not isinstance(content_html, str):
+        content_html = ""
+    excerpt_html = (post.get("excerpt") or {}).get("rendered", "")
+    if not isinstance(excerpt_html, str):
+        excerpt_html = ""
+    body_text = _rss_html_to_plain(content_html) or _rss_html_to_plain(excerpt_html)
+
+    image_url = (post.get("jetpack_featured_media_url") or "").strip()
+    if not image_url:
+        image_url = _first_article_image(content_html) or _first_article_image(
+            excerpt_html
+        )
+
+    return {
+        "title": title,
+        "link": link,
+        "summary": body_text,
+        "description": body_text,
+        "date": date_str,
+        "image_url": image_url,
+        "date_source": f"WP-API: {date_str}",
+    }
+
+
+def _wp_category_id(section: str) -> int | None:
+    wp_slug = _SECTION_WP_SLUG.get(section, section)
+    cats = _fetch_wp_json(
+        f"{BASE_URL}/wp-json/wp/v2/categories",
+        params={"slug": wp_slug, "_fields": "id,slug"},
+    )
+    if not isinstance(cats, list) or not cats:
+        print(f"[WARN] WP-API category not found for section={section} slug={wp_slug}")
+        return None
+    cat_id = cats[0].get("id")
+    return int(cat_id) if cat_id else None
+
+
+def fetch_section_wp_api(section: str, *, per_page: int = 15) -> list[dict[str, Any]]:
+    """WordPress REST API posts by category — GHA-safe (like economynext)."""
+    cat_id = _wp_category_id(section)
+    if cat_id is None:
+        return []
+
+    posts = _fetch_wp_json(
+        f"{BASE_URL}/wp-json/wp/v2/posts",
+        params={
+            "categories": cat_id,
+            "per_page": per_page,
+            "_fields": _WP_POST_FIELDS,
+            "orderby": "date",
+            "order": "desc",
+        },
+    )
+    if not isinstance(posts, list) or not posts:
+        print(f"[WARN] WP-API returned no posts for {section} (cat={cat_id})")
+        return []
+
+    articles: list[dict[str, Any]] = []
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        row = _wp_post_to_article(post)
+        if row:
+            articles.append(row)
+    if articles:
+        print(f"[INFO] WP-API {section}: {len(articles)} article(s)")
+    return articles
+
+
+def fetch_main_wp_api(*, per_page: int = 20) -> list[dict[str, Any]]:
+    """Site-wide latest posts via WP REST API."""
+    posts = _fetch_wp_json(
+        f"{BASE_URL}/wp-json/wp/v2/posts",
+        params={
+            "per_page": per_page,
+            "_fields": _WP_POST_FIELDS,
+            "orderby": "date",
+            "order": "desc",
+        },
+    )
+    if not isinstance(posts, list) or not posts:
+        return []
+    articles: list[dict[str, Any]] = []
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        row = _wp_post_to_article(post)
+        if row:
+            articles.append(row)
+    if articles:
+        print(f"[INFO] WP-API main: {len(articles)} article(s)")
+    return articles
 
 
 def fetch_rss_bytes(url: str, *, timeout: int = 30) -> bytes | None:
@@ -429,8 +585,7 @@ def _parse_rss_bytes(raw: bytes, *, label: str) -> list[dict[str, Any]]:
         return []
 
 
-def fetch_section_feed(section: str) -> list[dict[str, Any]]:
-    """Category RSS via plain Scrapling Fetcher (+ curl_cffi fallback)."""
+def _fetch_section_rss(section: str) -> list[dict[str, Any]]:
     timeout = 45 if _is_ci() else 30
     for feed_url in (
         f"{BASE_URL}/category/{section}/feed/",
@@ -447,8 +602,27 @@ def fetch_section_feed(section: str) -> list[dict[str, Any]]:
     return []
 
 
+def fetch_section_feed(section: str) -> list[dict[str, Any]]:
+    """Category feed: WP REST API on CI (RSS blocked); RSS then WP-API locally."""
+    if _is_ci():
+        items = fetch_section_wp_api(section)
+        if items:
+            return items
+        return _fetch_section_rss(section)
+
+    items = _fetch_section_rss(section)
+    if items:
+        return items
+    print(f"[INFO] RSS empty for {section} — trying WP-API fallback")
+    return fetch_section_wp_api(section)
+
+
 def fetch_main_feed() -> list[dict[str, Any]]:
-    """Site-wide RSS — fallback when category feeds are blocked."""
+    """Site-wide feed: WP-API on CI, RSS fallback locally."""
+    if _is_ci():
+        items = fetch_main_wp_api()
+        if items:
+            return items
     timeout = 45 if _is_ci() else 30
     for feed_url in (f"{BASE_URL}/feed/", "https://thinakaran.lk/feed/"):
         raw = fetch_rss_bytes(feed_url, timeout=timeout)
@@ -458,7 +632,7 @@ def fetch_main_feed() -> list[dict[str, Any]]:
         items = _parse_rss_bytes(raw, label="main")
         if items:
             return items
-    return []
+    return fetch_main_wp_api()
 
 
 # Back-compat alias for incremental_outlets

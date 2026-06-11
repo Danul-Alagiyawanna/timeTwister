@@ -53,14 +53,32 @@ def is_cloudflare_block(html: str) -> bool:
     return any(m.lower() in lower for m in markers)
 
 
-def _valid_response_body(body: bytes, *, expect_xml: bool = False) -> bool:
-    if not body or len(body) < 500:
+def _valid_response_body(
+    body: bytes,
+    *,
+    expect_xml: bool = False,
+    expect_json: bool = False,
+) -> bool:
+    if not body:
+        return False
+    min_len = 2 if expect_json else 500
+    if len(body) < min_len:
         return False
     sample = body[:8000].decode("utf-8", errors="ignore")
+    if expect_xml:
+        if is_cloudflare_block(sample):
+            return False
+        return "<?xml" in sample or "<rss" in sample
+    if expect_json:
+        stripped = sample.lstrip()
+        if not stripped.startswith(("[", "{")):
+            return False
+        # WP category lookups etc. are tiny JSON — not CF interstitials
+        if len(body) >= 500 and is_cloudflare_block(sample):
+            return False
+        return True
     if is_cloudflare_block(sample):
         return False
-    if expect_xml:
-        return "<?xml" in sample or "<rss" in sample
     return True
 
 
@@ -71,6 +89,7 @@ def _fetch_bytes_http_fallback(
     accept: str | None = None,
     timeout: int = 20,
     expect_xml: bool = False,
+    expect_json: bool = False,
     extra_headers: dict[str, str] | None = None,
 ) -> bytes | None:
     headers = dict(_BROWSER_HEADERS)
@@ -92,7 +111,7 @@ def _fetch_bytes_http_fallback(
             )
             body = resp.content or b""
             if resp.status_code == 200 and _valid_response_body(
-                body, expect_xml=expect_xml
+                body, expect_xml=expect_xml, expect_json=expect_json
             ):
                 print(f"[INFO] curl_cffi ({profile}) OK: {url[:80]}")
                 return body
@@ -116,7 +135,9 @@ def _fetch_bytes_http_fallback(
             headers=headers,
         )
         body = resp.content or b""
-        if resp.status_code == 200 and _valid_response_body(body, expect_xml=expect_xml):
+        if resp.status_code == 200 and _valid_response_body(
+            body, expect_xml=expect_xml, expect_json=expect_json
+        ):
             print(f"[INFO] requests OK: {url[:80]}")
             return body
         print(
@@ -264,6 +285,7 @@ def fetch_bytes(
     accept: str | None = None,
     timeout: int = 20,
     expect_xml: bool = False,
+    expect_json: bool = False,
     extra_headers: dict[str, str] | None = None,
     stealth_fallback: bool = False,
     stealth_first: bool = False,
@@ -282,7 +304,9 @@ def fetch_bytes(
         )
         if page:
             body = page.body or b""
-            if _valid_response_body(body, expect_xml=expect_xml):
+            if _valid_response_body(
+                body, expect_xml=expect_xml, expect_json=expect_json
+            ):
                 return body
 
         print(f"[INFO] Falling back to curl_cffi for {full_url[:80]}")
@@ -292,6 +316,7 @@ def fetch_bytes(
             accept=accept,
             timeout=timeout,
             expect_xml=expect_xml,
+            expect_json=expect_json,
             extra_headers=extra_headers,
         )
         if raw:

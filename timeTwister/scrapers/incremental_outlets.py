@@ -936,7 +936,7 @@ def run_virakesari_incremental() -> int:
 
 
 def run_thinakaran_incremental() -> int:
-    """Thinakaran incremental — RSS via Scrapling HTTP on CI; list+Selenium locally."""
+    """Thinakaran incremental — WP-API/RSS via Scrapling on CI; list+Selenium locally."""
     from incremental import (
         INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
         INCREMENTAL_RUN_LIMIT_PER_SECTION,
@@ -968,7 +968,11 @@ def run_thinakaran_incremental() -> int:
     is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
     print(
         "[INCREMENTAL] Thinakaran — "
-        + ("RSS feeds via Scrapling HTTP on CI" if is_ci else "list pages, RSS + Selenium fallback")
+        + (
+            "WP-API + RSS via Scrapling HTTP on CI"
+            if is_ci
+            else "list pages, RSS/WP-API + Selenium fallback"
+        )
     )
     if bootstrap:
         print(f"[INCREMENTAL] No section checkpoint; bootstrap max {max_articles} per section")
@@ -986,9 +990,9 @@ def run_thinakaran_incremental() -> int:
         return driver
 
     phase1_label = (
-        "RSS feeds (Scrapling HTTP)"
+        "WP-API feeds (Scrapling HTTP)"
         if is_ci
-        else "list pages (Scrapling) + RSS fallback"
+        else "list pages (Scrapling) + RSS/WP-API fallback"
     )
     print(f"\n[INCREMENTAL] Phase 1 — {phase1_label}")
     for name, page_url in pages:
@@ -1000,7 +1004,7 @@ def run_thinakaran_incremental() -> int:
             rss_items = mod.fetch_thinakaran_section_feed(name)
             links = [a["link"] for a in rss_items if a.get("link")]
             if links:
-                print(f"[PHASE 1] {name}: {len(links)} article(s) from section RSS")
+                print(f"[PHASE 1] {name}: {len(links)} article(s) from WP-API/RSS")
         else:
             links = collect_thinakaran_links(None, page_url)
             if not links:
@@ -1021,7 +1025,7 @@ def run_thinakaran_incremental() -> int:
         time.sleep(0.5 if is_ci else 1.0)
 
     if is_ci and sum(len(v) for v in section_links.values()) == 0:
-        print("[WARN] All section RSS empty — trying main site /feed/")
+        print("[WARN] All section feeds empty — trying main WP-API / RSS")
         main_items = mod.fetch_main_feed()
         if main_items:
             links = [a["link"] for a in main_items if a.get("link")]
