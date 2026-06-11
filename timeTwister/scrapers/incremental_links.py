@@ -463,13 +463,13 @@ def _thinakaran_page_ready(driver: Any) -> bool:
 
 
 def collect_thinakaran_links(driver: Any | None, url: str) -> list[str]:
-    """Thinakaran category feed — Scrapling first, Selenium scroll fallback."""
+    """Thinakaran category feed — Scrapling StealthyFetcher on CI, Selenium fallback locally."""
     import os
 
     links = _collect_thinakaran_links_scrapling(url)
     if links:
         return links
-    if driver is None:
+    if driver is None or os.getenv("CI", "").lower() in ("1", "true", "yes"):
         return []
 
     is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")

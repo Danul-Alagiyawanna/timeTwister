@@ -119,6 +119,10 @@ jobs:
         with:
           chrome-version: stable
 
+      - name: Install Playwright Chromium (Thinakaran StealthyFetcher fallback)
+        if: matrix.id == 'thinakaran'
+        run: python -m playwright install chromium
+
       - name: Run incremental scraper (FT.lk-style)
         if: matrix.incremental == true
         working-directory: timeTwister

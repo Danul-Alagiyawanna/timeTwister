@@ -936,7 +936,7 @@ def run_virakesari_incremental() -> int:
 
 
 def run_thinakaran_incremental() -> int:
-    """Thinakaran incremental — Scrapling list/RSS on GHA, lazy Selenium fallback."""
+    """Thinakaran incremental — Scrapling StealthyFetcher on GHA; Selenium only locally."""
     from incremental import (
         INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
         INCREMENTAL_RUN_LIMIT_PER_SECTION,
@@ -965,7 +965,11 @@ def run_thinakaran_incremental() -> int:
         else INCREMENTAL_RUN_LIMIT_PER_SECTION
     )
 
-    print("[INCREMENTAL] Thinakaran — Scrapling first (list + RSS), no Chrome on GHA")
+    is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
+    print(
+        "[INCREMENTAL] Thinakaran — Scrapling"
+        + (" StealthyFetcher on CI" if is_ci else " first, Selenium fallback locally")
+    )
     if bootstrap:
         print(f"[INCREMENTAL] No section checkpoint; bootstrap max {max_articles} per section")
     else:
@@ -985,7 +989,7 @@ def run_thinakaran_incremental() -> int:
     for name, page_url in pages:
         print(f"\n{'=' * 50}\n[INCREMENTAL] Thinakaran / {name}\n{page_url}")
         links = collect_thinakaran_links(None, page_url)
-        if not links:
+        if not links and not is_ci:
             links = collect_thinakaran_links(_ensure_driver(), page_url)
         if not links:
             rss_items = mod.fetch_thinakaran_section_feed(name)

@@ -4,7 +4,6 @@ RSS + HTML list/article fetch with curl_cffi GHA fallback.
 """
 from __future__ import annotations
 
-import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -14,7 +13,18 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from scrapling_fetch import fetch_bytes, fetch_text, is_cloudflare_block
+from scrapling_fetch import (
+    _is_ci,
+    fetch_bytes,
+    fetch_text,
+    is_cloudflare_block,
+)
+
+_STEALTH_KW = {
+    "stealth_fallback": True,
+    "stealth_first": _is_ci(),
+}
+_LIST_WAIT = "ul.penci-wrapper-data"
 
 BASE_URL = "https://www.thinakaran.lk"
 _HEADERS = {"Referer": f"{BASE_URL}/"}
@@ -125,14 +135,21 @@ def parse_list_cards_from_html(html: str) -> list[dict[str, Any]]:
 
 
 def fetch_category_html(url: str, *, timeout: int | None = None) -> str | None:
-    is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
     if timeout is None:
-        timeout = 45 if is_ci else 25
+        timeout = 60 if _is_ci() else 25
     page_url = url.rstrip("/") + "/"
-    return fetch_text(page_url, timeout=timeout, extra_headers=_HEADERS)
+    return fetch_text(
+        page_url,
+        timeout=timeout,
+        extra_headers=_HEADERS,
+        wait_selector=_LIST_WAIT,
+        **_STEALTH_KW,
+    )
 
 
-def collect_category_links(url: str, *, max_attempts: int = 3) -> list[str]:
+def collect_category_links(url: str, *, max_attempts: int | None = None) -> list[str]:
+    if max_attempts is None:
+        max_attempts = 1 if _is_ci() else 3
     for attempt in range(1, max_attempts + 1):
         html = fetch_category_html(url)
         if not html or not html_ready(html):
@@ -231,7 +248,15 @@ def extract_article_content_from_html(html: str, url: str) -> dict[str, Any]:
 
 
 def fetch_article_content(url: str, *, timeout: int = 30) -> dict[str, Any] | None:
-    html = fetch_text(url, timeout=timeout, extra_headers=_HEADERS)
+    if _is_ci():
+        timeout = max(timeout, 60)
+    html = fetch_text(
+        url,
+        timeout=timeout,
+        extra_headers=_HEADERS,
+        wait_selector="article .entry-content, .entry-content, article",
+        **_STEALTH_KW,
+    )
     if not html or is_cloudflare_block(html):
         return None
     return extract_article_content_from_html(html, url)
@@ -297,12 +322,13 @@ def fetch_section_feed(section: str) -> list[dict[str, Any]]:
     raw = fetch_bytes(
         feed_url,
         accept="application/rss+xml, application/xml, text/xml, */*",
-        timeout=30,
+        timeout=60 if _is_ci() else 30,
         expect_xml=True,
         extra_headers={
             **_HEADERS,
             "Accept": "application/rss+xml, application/xml, text/xml, */*",
         },
+        **_STEALTH_KW,
     )
     if not raw:
         return []
