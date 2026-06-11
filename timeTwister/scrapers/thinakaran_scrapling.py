@@ -20,14 +20,19 @@ from scrapling_fetch import (
     is_cloudflare_block,
 )
 
-_STEALTH_KW = {
-    "stealth_fallback": True,
-    "stealth_first": _is_ci(),
-}
 _LIST_WAIT = "ul.penci-wrapper-data"
+_RSS_ACCEPT = "application/rss+xml, application/xml, text/xml, */*"
 
 BASE_URL = "https://www.thinakaran.lk"
 _HEADERS = {"Referer": f"{BASE_URL}/"}
+_RSS_HEADERS = {**_HEADERS, "Accept": _RSS_ACCEPT}
+
+
+def _html_stealth_kw() -> dict[str, bool]:
+    """Browser stealth only for local HTML fallback — never on CI (Turnstile loop)."""
+    if _is_ci():
+        return {}
+    return {"stealth_fallback": True, "stealth_first": False}
 
 THINAKARAN_SECTIONS = (
     "local",
@@ -134,16 +139,27 @@ def parse_list_cards_from_html(html: str) -> list[dict[str, Any]]:
     return cards
 
 
+def fetch_rss_bytes(url: str, *, timeout: int = 30) -> bytes | None:
+    """Category/main RSS via plain Scrapling HTTP (no StealthyFetcher)."""
+    return fetch_bytes(
+        url,
+        accept=_RSS_ACCEPT,
+        timeout=timeout,
+        expect_xml=True,
+        extra_headers=_RSS_HEADERS,
+    )
+
+
 def fetch_category_html(url: str, *, timeout: int | None = None) -> str | None:
     if timeout is None:
-        timeout = 60 if _is_ci() else 25
+        timeout = 45 if _is_ci() else 25
     page_url = url.rstrip("/") + "/"
     return fetch_text(
         page_url,
         timeout=timeout,
         extra_headers=_HEADERS,
         wait_selector=_LIST_WAIT,
-        **_STEALTH_KW,
+        **_html_stealth_kw(),
     )
 
 
@@ -248,14 +264,12 @@ def extract_article_content_from_html(html: str, url: str) -> dict[str, Any]:
 
 
 def fetch_article_content(url: str, *, timeout: int = 30) -> dict[str, Any] | None:
-    if _is_ci():
-        timeout = max(timeout, 60)
     html = fetch_text(
         url,
         timeout=timeout,
         extra_headers=_HEADERS,
         wait_selector="article .entry-content, .entry-content, article",
-        **_STEALTH_KW,
+        **_html_stealth_kw(),
     )
     if not html or is_cloudflare_block(html):
         return None
@@ -316,34 +330,51 @@ def parse_rss(xml_text: str) -> list[dict[str, Any]]:
     return articles
 
 
-def fetch_section_feed(section: str) -> list[dict[str, Any]]:
-    """Category RSS via Scrapling (GHA-safe)."""
-    feed_url = f"{BASE_URL}/category/{section}/feed/"
-    raw = fetch_bytes(
-        feed_url,
-        accept="application/rss+xml, application/xml, text/xml, */*",
-        timeout=60 if _is_ci() else 30,
-        expect_xml=True,
-        extra_headers={
-            **_HEADERS,
-            "Accept": "application/rss+xml, application/xml, text/xml, */*",
-        },
-        **_STEALTH_KW,
-    )
-    if not raw:
-        return []
+def _parse_rss_bytes(raw: bytes, *, label: str) -> list[dict[str, Any]]:
     xml_text = raw.decode("utf-8", errors="replace")
     if is_cloudflare_block(xml_text):
-        print(f"[WARN] Cloudflare interstitial on {feed_url}")
+        print(f"[WARN] Cloudflare interstitial on {label}")
         return []
     try:
         items = parse_rss(xml_text)
         if items:
-            print(f"[INFO] RSS {section}: {len(items)} article(s)")
+            print(f"[INFO] RSS {label}: {len(items)} article(s)")
         return items
     except Exception as e:
-        print(f"[WARN] RSS parse error ({section}): {e}")
+        print(f"[WARN] RSS parse error ({label}): {e}")
         return []
+
+
+def fetch_section_feed(section: str) -> list[dict[str, Any]]:
+    """Category RSS via plain Scrapling Fetcher (+ curl_cffi fallback)."""
+    timeout = 45 if _is_ci() else 30
+    for feed_url in (
+        f"{BASE_URL}/category/{section}/feed/",
+        f"https://thinakaran.lk/category/{section}/feed/",
+    ):
+        raw = fetch_rss_bytes(feed_url, timeout=timeout)
+        if not raw:
+            print(f"[WARN] RSS fetch failed: {feed_url}")
+            continue
+        print(f"[INFO] RSS fetched {feed_url} ({len(raw)} bytes)")
+        items = _parse_rss_bytes(raw, label=section)
+        if items:
+            return items
+    return []
+
+
+def fetch_main_feed() -> list[dict[str, Any]]:
+    """Site-wide RSS — fallback when category feeds are blocked."""
+    timeout = 45 if _is_ci() else 30
+    for feed_url in (f"{BASE_URL}/feed/", "https://thinakaran.lk/feed/"):
+        raw = fetch_rss_bytes(feed_url, timeout=timeout)
+        if not raw:
+            continue
+        print(f"[INFO] Main RSS fetched {feed_url} ({len(raw)} bytes)")
+        items = _parse_rss_bytes(raw, label="main")
+        if items:
+            return items
+    return []
 
 
 # Back-compat alias for incremental_outlets

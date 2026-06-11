@@ -21,6 +21,7 @@ from thinakaran_scrapling import (
     extract_article_content_from_html,
     fetch_article_content,
     fetch_category_html,
+    fetch_main_feed,
     fetch_section_feed,
     fetch_thinakaran_section_feed,
     parse_list_cards_from_html,

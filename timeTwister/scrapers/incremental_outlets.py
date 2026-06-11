@@ -936,7 +936,7 @@ def run_virakesari_incremental() -> int:
 
 
 def run_thinakaran_incremental() -> int:
-    """Thinakaran incremental — Scrapling StealthyFetcher on GHA; Selenium only locally."""
+    """Thinakaran incremental — RSS via Scrapling HTTP on CI; list+Selenium locally."""
     from incremental import (
         INCREMENTAL_BOOTSTRAP_LIMIT_PER_SECTION,
         INCREMENTAL_RUN_LIMIT_PER_SECTION,
@@ -967,8 +967,8 @@ def run_thinakaran_incremental() -> int:
 
     is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
     print(
-        "[INCREMENTAL] Thinakaran — Scrapling"
-        + (" StealthyFetcher on CI" if is_ci else " first, Selenium fallback locally")
+        "[INCREMENTAL] Thinakaran — "
+        + ("RSS feeds via Scrapling HTTP on CI" if is_ci else "list pages, RSS + Selenium fallback")
     )
     if bootstrap:
         print(f"[INCREMENTAL] No section checkpoint; bootstrap max {max_articles} per section")
@@ -985,23 +985,51 @@ def run_thinakaran_incremental() -> int:
             driver = mod.create_driver()
         return driver
 
-    print("\n[INCREMENTAL] Phase 1 — list pages (Scrapling) + RSS fallback")
+    phase1_label = (
+        "RSS feeds (Scrapling HTTP)"
+        if is_ci
+        else "list pages (Scrapling) + RSS fallback"
+    )
+    print(f"\n[INCREMENTAL] Phase 1 — {phase1_label}")
     for name, page_url in pages:
         print(f"\n{'=' * 50}\n[INCREMENTAL] Thinakaran / {name}\n{page_url}")
-        links = collect_thinakaran_links(None, page_url)
-        if not links and not is_ci:
-            links = collect_thinakaran_links(_ensure_driver(), page_url)
-        if not links:
+        links: list[str] = []
+        rss_items: list[dict[str, Any]] = []
+
+        if is_ci:
             rss_items = mod.fetch_thinakaran_section_feed(name)
             links = [a["link"] for a in rss_items if a.get("link")]
+            if links:
+                print(f"[PHASE 1] {name}: {len(links)} article(s) from section RSS")
+        else:
+            links = collect_thinakaran_links(None, page_url)
+            if not links:
+                links = collect_thinakaran_links(_ensure_driver(), page_url)
+            if not links:
+                rss_items = mod.fetch_thinakaran_section_feed(name)
+                links = [a["link"] for a in rss_items if a.get("link")]
+                if links:
+                    print(f"[PHASE 1] {name}: {len(links)} article(s) from RSS fallback")
+            else:
+                print(f"[INFO] {len(links)} links on list page")
+
+        if rss_items:
             section_rss_rows[name] = {
                 normalize_link(a["link"]): a for a in rss_items if a.get("link")
             }
-            print(f"[PHASE 1] {name}: {len(links)} article(s) from RSS fallback")
-        else:
-            print(f"[INFO] {len(links)} links on list page")
         section_links[name] = links
-        time.sleep(1.0)
+        time.sleep(0.5 if is_ci else 1.0)
+
+    if is_ci and sum(len(v) for v in section_links.values()) == 0:
+        print("[WARN] All section RSS empty — trying main site /feed/")
+        main_items = mod.fetch_main_feed()
+        if main_items:
+            links = [a["link"] for a in main_items if a.get("link")]
+            section_links["local"] = links
+            section_rss_rows["local"] = {
+                normalize_link(a["link"]): a for a in main_items if a.get("link")
+            }
+            print(f"[PHASE 1] main feed: {len(links)} article(s)")
 
     if sum(len(v) for v in section_links.values()) == 0:
         print("[ERROR] All Thinakaran sections empty — keeping data unchanged")
@@ -1054,11 +1082,14 @@ def run_thinakaran_incremental() -> int:
                     summary = (
                         rss_row.get("summary") or rss_row.get("description") or ""
                     ).strip()
-                    if len(summary) < 200:
-                        row = fetch_article(driver, link)
-                        if row:
-                            rss_row = row
                     row = dict(rss_row)
+                    if not is_ci and len(summary) < 200:
+                        fetched = fetch_article(driver, link)
+                        if fetched:
+                            row = fetched
+                elif is_ci:
+                    print(f"[SKIP] No RSS body on CI for {link[:70]}...")
+                    continue
                 else:
                     row = fetch_article(driver, link)
 
