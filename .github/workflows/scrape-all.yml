@@ -1,6 +1,9 @@
-# Run all TimeTwister scrapers (matrix).
+# Run TimeTwister scrapers on GHA (matrix).
 # incremental=true → FT.lk-style (--incremental, checkpoint, replace JSON only)
 # incremental=false → date-range (yesterday–today) + xvfb on CI
+#
+# Local-only (home IP / residential): ceylontoday, dailynews, dinamina, economynext,
+# ftlk, island, sundayobserver, thinakaran — run via run_scrapers.py on your machine.
 
 name: Scrape all news outlets
 
@@ -20,19 +23,13 @@ on:
         options:
           - all
           - sundaytimes
-          - dailynews
-          - ceylontoday
           - dailymirror
-          - ftlk
-          - economynext
           - morning
-          - sundayobserver
           - divaina
           - lankadeepa
           - aruna
           - mawbima
           - virakesari
-          - thinakaran
           - thamilan
   schedule:
     - cron: "0 6,18 * * *"
@@ -56,19 +53,13 @@ jobs:
           script: |
             const all = [
               { id: 'sundaytimes', module: 'sundaytimes_selenium_json', data_file: 'sundaytimes_latest_news.json', incremental: true },
-              { id: 'dailynews', module: 'dailynews_selenium_json', data_file: 'dailynews_latest_news.json', incremental: true },
-              { id: 'ceylontoday', module: 'ceylontoday_selenium_json', data_file: 'ceylontoday_finance.json', incremental: true },
               { id: 'dailymirror', module: 'dailymirror_selenium_json', data_file: 'dailymirror_latest_news.json', incremental: true },
-              { id: 'ftlk', module: 'ftlk_selenium_json', data_file: 'ftlk_latest_news.json', incremental: true },
-              { id: 'economynext', module: 'economynext_selenium_json', data_file: 'economynext_latest_news.json', incremental: true },
               { id: 'morning', module: 'themorning_selenium_json', data_file: 'themorning_latest_news.json', incremental: true },
-              { id: 'sundayobserver', module: 'sundayobserver_selenium_json', data_file: 'sundayobserver_latest_news.json', incremental: true },
               { id: 'divaina', module: 'divaina_selenium_json', data_file: 'divaina_latest_news.json', incremental: true },
               { id: 'lankadeepa', module: 'lankadeepa_selenium_json', data_file: 'lankadeepa_latest_news.json', incremental: true },
               { id: 'aruna', module: 'aruna_selenium_json', data_file: 'aruna_latest_news.json', incremental: true },
               { id: 'mawbima', module: 'mawbima_selenium_json', data_file: 'mawbima_latest_news.json', incremental: true },
               { id: 'virakesari', module: 'virakesari_selenium_json', data_file: 'virakesari_latest_news.json', incremental: true },
-              { id: 'thinakaran', module: 'thinakaran_selenium_json', data_file: 'thinakaran_latest_news.json', incremental: true },
               { id: 'thamilan', module: 'thamilan_selenium_json', data_file: 'thamilan_latest_news.json', incremental: true },
             ];
             const input = context.payload.inputs?.scraper;
