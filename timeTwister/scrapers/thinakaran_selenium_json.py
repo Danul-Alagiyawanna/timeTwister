@@ -1,316 +1,104 @@
-try:
-    import undetected_chromedriver as uc  # type: ignore
-    USE_UNDETECTED = True
-    print("[INFO] undetected-chromedriver imported successfully")
-except ImportError as e:
-    USE_UNDETECTED = False
-    print(f"[WARNING] undetected-chromedriver not available: {e}")
-    print("[INFO] Will use regular Selenium (may be blocked by Cloudflare)")
-except Exception as e:
-    USE_UNDETECTED = False
-    print(f"[WARNING] Error importing undetected-chromedriver: {e}")
-    print("[INFO] Will use regular Selenium (may be blocked by Cloudflare)")
+"""
+Thinakaran scraper — uses Scrapling HTTP fetcher (no Selenium on GHA).
+Incremental mode: incremental_outlets.run_thinakaran_incremental().
+"""
+from __future__ import annotations
 
-# Always import selenium components
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-
-from bs4 import BeautifulSoup
-import time
 import json
-import sys
-from datetime import datetime, timedelta
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import os
 import re
+import sys
+import time
+from datetime import datetime, timedelta
 
-BASE_URL = "https://www.thinakaran.lk/category/local/"
-THINAKARAN_SECTIONS = (
-    "local",
-    "politics",
-    "features",
-    "editorial",
-    "sports",
-    "business",
+from scrapling_fetch import is_cloudflare_block
+from scrapling_page import HtmlPage
+
+from thinakaran_scrapling import (
+    BASE_URL,
+    THINAKARAN_SECTIONS,
+    collect_category_links,
+    extract_article_content_from_html,
+    fetch_article_content,
+    fetch_category_html,
+    fetch_section_feed,
+    fetch_thinakaran_section_feed,
+    parse_list_cards_from_html,
+    parse_thinakaran_date,
 )
-_THINAKARAN_ARTICLE_RE = re.compile(
-    r"https?://(?:www\.)?thinakaran\.lk/\d{4}/\d{2}/\d{2}/",
-    re.I,
-)
+
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 
 class TimeoutError(Exception):
-    """Custom timeout exception for extraction"""
     pass
 
+
+def extract_article_content(driver, max_elapsed_time=30):
+    url = getattr(driver, "current_url", "") or ""
+    if isinstance(driver, HtmlPage):
+        return extract_article_content_from_html(driver.page_source, url)
+
+    if url.startswith("http"):
+        content = fetch_article_content(url, timeout=max_elapsed_time)
+        if content and (content.get("title") or content.get("description")):
+            return content
+
+    time.sleep(2)
+    return extract_article_content_from_html(driver.page_source, url)
+
+
 def extract_with_timeout(driver, timeout_seconds=30):
-    """Extract article content with timeout. Returns None if timeout exceeded."""
     start_time = time.time()
-    
     try:
         result = extract_article_content(driver, max_elapsed_time=timeout_seconds)
         elapsed = time.time() - start_time
-        
         if elapsed > timeout_seconds:
-            print(f"     [TIMEOUT] Extraction took {elapsed:.1f}s (exceeded {timeout_seconds}s limit)")
+            print(f"     [TIMEOUT] Extraction took {elapsed:.1f}s")
             return None
-        
         return result
     except TimeoutError:
-        elapsed = time.time() - start_time
-        print(f"     [TIMEOUT] Extraction timeout exceeded after {elapsed:.1f}s")
         return None
     except Exception as e:
-        elapsed = time.time() - start_time
-        if elapsed > timeout_seconds:
-            print(f"     [TIMEOUT] Extraction failed after {elapsed:.1f}s (exceeded {timeout_seconds}s limit): {e}")
+        if time.time() - start_time > timeout_seconds:
+            print(f"     [TIMEOUT] Extraction failed: {e}")
             return None
         raise
 
-def extract_article_content(driver, max_elapsed_time=30):
-    """Extract detailed content from article page."""
-    start_time = time.time()
-    print(f"     [EXTRACT] Function started")
-    try:
-        print(f"     [EXTRACT] Current URL: {driver.current_url}")
-        print(f"     [EXTRACT] Page title: {driver.title}")
-        
-        if time.time() - start_time > max_elapsed_time:
-            raise TimeoutError("Extraction timeout exceeded")
-        
-        print(f"     [EXTRACT] Waiting 2 seconds for initial page load...")
-        time.sleep(2)
-
-        if time.time() - start_time > max_elapsed_time:
-            raise TimeoutError("Extraction timeout exceeded")
-
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-
-        # Extract publication date
-        date_published = None
-        date_meta = soup.find('meta', attrs={'property': 'article:published_time'})
-        if date_meta and date_meta.has_attr('content'):
-            try:
-                date_str = date_meta['content']
-                date_str_clean = date_str.split('+')[0].split('T')
-                if len(date_str_clean) == 2:
-                    date_published = datetime.strptime(f"{date_str_clean[0]} {date_str_clean[1]}", "%Y-%m-%d %H:%M:%S")
-                    print(f"     Found exact date: {date_published}")
-            except ValueError as e:
-                print(f"     Error parsing date '{date_meta['content']}': {e}")
-        
-        if not date_published:
-            time_tag = soup.find('time')
-            if time_tag and time_tag.has_attr('datetime'):
-                try:
-                    date_str = time_tag['datetime']
-                    date_str_clean = date_str.split('+')[0].split('T')
-                    if len(date_str_clean) == 2:
-                        date_published = datetime.strptime(f"{date_str_clean[0]} {date_str_clean[1]}", "%Y-%m-%d %H:%M:%S")
-                        print(f"     Found date from time tag: {date_published}")
-                except:
-                    pass
-
-        # Extract image URL
-        image_url = ""
-        og_image = soup.find('meta', attrs={'property': 'og:image'})
-        if og_image and og_image.has_attr('content'):
-            image_url = og_image['content']
-            print(f"     Found image: {image_url[:60]}...")
-
-        # Extract full article text
-        full_article_text = ""
-        extraction_successful = False
-        
-        if time.time() - start_time > max_elapsed_time:
-            raise TimeoutError("Extraction timeout exceeded")
-        
-        # Strategy 1: Try to find article content
-        if not extraction_successful:
-            try:
-                if time.time() - start_time > max_elapsed_time:
-                    raise TimeoutError("Extraction timeout exceeded")
-                
-                print(f"     [EXTRACT] Waiting for article content...")
-                article_body = None
-                
-                selectors = [
-                    "article .entry-content",
-                    ".entry-content",
-                    "article .post-content",
-                    ".post-content",
-                    ".article-content",
-                    "article"
-                ]
-                
-                for selector in selectors:
-                    try:
-                        article_body = WebDriverWait(driver, 5).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                        )
-                        print(f"     [EXTRACT] ✓ Found article content using selector: {selector}")
-                        break
-                    except:
-                        continue
-                
-                if article_body:
-                    if time.time() - start_time > max_elapsed_time:
-                        raise TimeoutError("Extraction timeout exceeded")
-                    
-                    time.sleep(1)
-                    
-                    paragraphs = article_body.find_elements(By.TAG_NAME, "p")
-                    print(f"     [DEBUG] Found {len(paragraphs)} <p> tags in article body")
-                    
-                    paragraph_texts = []
-                    
-                    if len(paragraphs) == 0:
-                        print(f"     [DEBUG] No <p> tags, trying to get text directly from div...")
-                        try:
-                            all_text = article_body.text.strip()
-                            if all_text and len(all_text) > 50:
-                                text_chunks = [chunk.strip() for chunk in all_text.split('\n') if chunk.strip()]
-                                paragraph_texts = [chunk for chunk in text_chunks if len(chunk) > 20]
-                                print(f"     [DEBUG] Got {len(paragraph_texts)} text chunks from div")
-                        except Exception as e:
-                            print(f"     [DEBUG]   Error getting text from div: {e}")
-                    else:
-                        for idx, p in enumerate(paragraphs):
-                            try:
-                                text = p.text.strip()
-                                if text:
-                                    paragraph_texts.append(text)
-                                    if idx < 3:
-                                        print(f"     [DEBUG]   Paragraph {idx+1}: {text[:100]}...")
-                            except Exception as e:
-                                print(f"     [DEBUG]   Error getting text from paragraph {idx+1}: {e}")
-                                continue
-                    
-                    if paragraph_texts:
-                        full_article_text = "\n\n".join(paragraph_texts)
-                        extraction_successful = True
-                        print(f"     ✓ Extracted {len(paragraph_texts)} paragraphs ({len(full_article_text)} chars)")
-                else:
-                    print(f"     [DEBUG] Could not find article body with any selector")
-            except Exception as e:
-                print(f"     Strategy 1 extraction failed: {e}")
-        
-        # Strategy 2: BeautifulSoup fallback
-        if not extraction_successful:
-            try:
-                article_div = soup.find('div', class_='entry-content')
-                if not article_div:
-                    article_div = soup.find('div', class_='post-content')
-                if not article_div:
-                    article_div = soup.find('div', class_='article-content')
-                if not article_div:
-                    article_div = soup.find('article')
-                
-                if article_div:
-                    paragraphs = article_div.find_all('p')
-                    paragraph_texts = [p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)]
-                    
-                    if not paragraph_texts:
-                        print(f"     [DEBUG] No <p> tags in BeautifulSoup, getting text directly...")
-                        all_text = article_div.get_text(separator='\n', strip=True)
-                        text_chunks = [chunk.strip() for chunk in all_text.split('\n') if chunk.strip()]
-                        paragraph_texts = [chunk for chunk in text_chunks if len(chunk) > 20]
-                        print(f"     [DEBUG] Got {len(paragraph_texts)} text chunks via BeautifulSoup")
-                    
-                    if paragraph_texts:
-                        full_article_text = "\n\n".join(paragraph_texts)
-                        extraction_successful = True
-                        print(f"     Extracted {len(paragraph_texts)} paragraphs using BeautifulSoup")
-            except Exception as e:
-                print(f"     BeautifulSoup fallback failed: {e}")
-        
-        if not extraction_successful:
-            print(f"     WARNING: Could not extract full article text from any method")
-
-        # Extract title
-        title = ""
-        og_title = soup.find('meta', attrs={'property': 'og:title'})
-        if og_title and og_title.has_attr('content'):
-            title = og_title['content']
-
-        current_url = driver.current_url
-
-        print(f"     [EXTRACT] Extraction complete. Summary length: {len(full_article_text)} chars")
-        print(f"     [EXTRACT] Returning results...")
-
-        return {
-            'date_published': date_published,
-            'image_url': image_url,
-            'description': full_article_text,
-            'title': title,
-            'link': current_url
-        }
-
-    except Exception as e:
-        print(f"     [EXTRACT] ✗ Error extracting metadata: {e}")
-        import traceback
-        print(f"     [EXTRACT] Full traceback:")
-        traceback.print_exc()
-        return {
-            'date_published': None,
-            'image_url': "",
-            'description': "",
-            'title': "",
-            'link': driver.current_url if driver else ""
-        }
 
 def is_article_in_date_range(article_date, start_date, end_date):
-    """Check if article date falls within the specified range."""
     if not article_date:
         return False
-    
-    article_date = article_date.date()
-    return start_date <= article_date <= end_date
+    return start_date <= article_date.date() <= end_date
 
-def parse_thinakaran_date(date_text):
-    """Parse Thinakaran date format."""
-    try:
-        article_date = datetime.strptime(date_text.strip(), "%B %d, %Y")
-        return article_date
-    except:
-        pass
-    
-    for fmt in ["%d %B %Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"]:
-        try:
-            article_date = datetime.strptime(date_text.strip(), fmt)
-            return article_date
-        except:
-            continue
-    
-    return None
 
-def process_articles_from_page(driver, list_url, start_date, end_date):
-    """Process articles from single page with progressive scrolling - SIMPLE APPROACH."""
+def process_articles_from_page(list_url, start_date, end_date, processed_urls=None):
+    """Process one category page via Scrapling HTTP."""
+    if processed_urls is None:
+        processed_urls = set()
+
     print(f"\n[INFO] Processing articles from: {list_url}")
-    print(f"[DEBUG] Navigating to: {list_url}")
+    html = fetch_category_html(list_url)
+    if not html:
+        print("   Failed to load list page.")
+        return [], 0, 0
+    if is_cloudflare_block(html):
+        print("   [WARNING] Cloudflare block — retrying...")
+        time.sleep(5)
+        html = fetch_category_html(list_url, timeout=45)
+        if not html or is_cloudflare_block(html):
+            return [], 0, 0
 
-    try:
-        print(f"[DEBUG] Calling driver.get()...")
-        driver.get(list_url)
-        print(f"[DEBUG] driver.get() completed")
-        print(f"[DEBUG] Waiting for page to be ready...")
-        
-        WebDriverWait(driver, 30).until(
-            lambda d: d.execute_script('return document.readyState') == 'complete'
-        )
-        print(f"[DEBUG] Page ready state: complete")
-        
-        time.sleep(3)
-        
-        print(f"[DEBUG] Current page title: {driver.title}")
-        print(f"[DEBUG] Current URL: {driver.current_url}")
-    except Exception as e:
-        print(f"[ERROR] Failed to navigate to page: {e}")
-        import traceback
-        traceback.print_exc()
+    cards = parse_list_cards_from_html(html)
+    print(f"   Found {len(cards)} articles in list container")
+    if not cards:
         return [], 0, 0
 
     articles_found = []
@@ -318,368 +106,93 @@ def process_articles_from_page(driver, list_url, start_date, end_date):
     articles_outside_range = 0
     consecutive_outside_range = 0
     max_consecutive_outside = 3
-    
-    print(f"   Pre-loading articles by scrolling...")
-    
-    # FIRST: Scroll multiple times to load all articles (infinite scroll)
-    scroll_increment = 800
-    for scroll_round in range(10):  # Scroll 10 times to load articles
-        current_height = driver.execute_script("return document.body.scrollHeight")
-        driver.execute_script(f"window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)  # Wait for content to load
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        
-        if new_height == current_height:
-            print(f"   [SCROLL] No more content loading, stopping pre-scroll")
-            break
-        print(f"   [SCROLL] Round {scroll_round + 1}: Loaded more content")
-    
-    # Scroll back to top
-    driver.execute_script("window.scrollTo(0, 0);")
-    time.sleep(1)
-    
-    # Find all article elements inside the main container
-    print(f"   Now scraping articles...")
-    
-    try:
-        container = driver.find_element(By.CSS_SELECTOR, "ul.penci-wrapper-data")
-        article_elements = container.find_elements(By.TAG_NAME, "article")
-        print(f"   [DEBUG] Found {len(article_elements)} articles in main container")
-    except Exception as e:
-        print(f"   [ERROR] Could not find article container: {e}")
-        return [], 0, 0
-    
-    for article_idx, article_el in enumerate(article_elements):
-        # Extract title and link from h2 > a
-        try:
-            heading_link = article_el.find_element(By.CSS_SELECTOR, "h2.penci-entry-title a")
-            title = heading_link.text.strip()
-            article_link = heading_link.get_attribute('href')
-        except:
-            print(f"   [SCAN] Article {article_idx}: no heading link, skipping")
-            continue
-        
-        # Extract date from time element's datetime attribute
-        date_text = ""
-        article_date = None
-        try:
-            time_el = article_el.find_element(By.CSS_SELECTOR, "time.entry-date")
-            datetime_attr = time_el.get_attribute('datetime')  # e.g. "2026-02-09T15:59:52+05:30"
-            if datetime_attr:
-                date_str = datetime_attr.split('+')[0].split('T')[0]  # "2026-02-09"
-                article_date = datetime.strptime(date_str, "%Y-%m-%d")
-                date_text = time_el.text.strip()
-        except:
-            # fallback to text
-            try:
-                time_el = article_el.find_element(By.CSS_SELECTOR, "time.entry-date")
-                date_text = time_el.text.strip()
-                article_date = parse_thinakaran_date(date_text)
-            except:
-                pass
-        
-        if not title and not article_link:
+
+    for idx, card in enumerate(cards):
+        article_link = card.get("link") or ""
+        title = card.get("title") or ""
+        article_date = card.get("date_published")
+        date_text = card.get("date_text") or ""
+
+        if not article_link or article_link in processed_urls:
             continue
 
-        print(f"\n   Article {article_idx}: {title[:60]}...")
+        print(f"\n   Article {idx}: {title[:60]}...")
         print(f"     Link: {article_link}")
         print(f"     Date: {article_date.strftime('%Y-%m-%d') if article_date else date_text}")
 
-        # Check if article is in date range
         if article_date is None:
-            print(f"     No date found, skipping article")
+            print("     No date found, skipping article")
             consecutive_outside_range += 1
-        elif is_article_in_date_range(article_date, start_date, end_date):
-            print(f"     Article is in date range! Attempting to extract full content...")
-
-            original_window = driver.current_window_handle
-            opened_new_tab = False
-            
+        elif not is_article_in_date_range(article_date, start_date, end_date):
+            print(f"     [SKIP] Outside date range")
+            articles_outside_range += 1
+            consecutive_outside_range += 1
+            days_before = (start_date - article_date.date()).days
+            if days_before > 2:
+                break
+            if consecutive_outside_range >= max_consecutive_outside:
+                break
+            continue
+        else:
             final_date = article_date
             final_title = title
             final_image = ""
             final_description = ""
             extraction_successful = False
-            
-            try:
-                print(f"     [NEW TAB] Attempting to open article in new tab: {article_link}")
-                
-                windows_before = set(driver.window_handles)
-                driver.execute_script("window.open(arguments[0], '_blank');", article_link)
-                time.sleep(2)
-                
-                windows_after = set(driver.window_handles)
-                new_windows = windows_after - windows_before
-                
-                if new_windows:
-                    new_window = new_windows.pop()
-                    driver.switch_to.window(new_window)
-                    opened_new_tab = True
-                    print(f"     [NEW TAB] ✓ Switched to new tab")
-                    
-                    print(f"     [NEW TAB] Waiting for page to load...")
-                    time.sleep(3)
-                    
-                    current_url = driver.current_url
-                    print(f"     [NEW TAB] Current URL: {current_url}")
-                else:
-                    print(f"     [WARNING] New tab did not open, trying direct navigation...")
-                    driver.set_page_load_timeout(30)
-                    driver.get(article_link)
-                    opened_new_tab = False
-                    time.sleep(3)
 
-                # Extract content
-                print(f"     [EXTRACT] Starting content extraction (30s timeout)...")
-                try:
-                    article_content = extract_with_timeout(driver, timeout_seconds=30)
-                    
-                    if article_content is None:
-                        print(f"     [TIMEOUT] Extraction exceeded 30 seconds")
-                    else:
-                        print(f"     [EXTRACT] Content extraction completed")
-                        print(f"     [EXTRACT] Description length: {len(article_content.get('description', ''))}")
+            print("     Fetching article page...")
+            article_content = fetch_article_content(article_link)
+            if article_content:
+                if article_content.get("date_published"):
+                    final_date = article_content["date_published"]
+                if article_content.get("title"):
+                    final_title = article_content["title"]
+                if article_content.get("image_url"):
+                    final_image = article_content["image_url"]
+                extracted = (article_content.get("description") or "").strip()
+                if extracted:
+                    final_description = extracted
+                    extraction_successful = True
 
-                        final_date = article_content['date_published'] if article_content.get('date_published') else article_date
-                        final_title = article_content['title'] if article_content.get('title') else title
-                        final_image = article_content['image_url'] if article_content.get('image_url') else ""
-                                
-                        extracted_desc = article_content.get('description', '').strip()
-                        if extracted_desc and len(extracted_desc) > 0:
-                            final_description = extracted_desc
-                            extraction_successful = True
-                            print(f"     ✓ Using extracted full article text ({len(final_description)} chars)")
-                        else:
-                            print(f"     ⚠ Extracted description is empty")
-                except Exception as extract_error:
-                    print(f"     [EXTRACT] ✗ Error during extraction: {extract_error}")
-                
-                # Return to list page
-                if opened_new_tab:
-                    print(f"     [CLOSE TAB] Closing article tab...")
-                    try:
-                        driver.close()
-                        driver.switch_to.window(original_window)
-                        time.sleep(1)
-                    except Exception as close_error:
-                        print(f"     [WARNING] Error closing tab: {close_error}")
-                        driver.get(list_url)
-                        time.sleep(2)
-                else:
-                    print(f"     [BACK] Navigating back...")
-                    try:
-                        driver.set_page_load_timeout(10)
-                        driver.back()
-                        time.sleep(2)
-                    except Exception as back_error:
-                        print(f"     [WARNING] Back() failed: {back_error}")
-                        driver.get(list_url)
-                        time.sleep(3)
-
-            except Exception as e:
-                print(f"     ✗ Error during navigation/extraction: {e}")
-                try:
-                    if opened_new_tab:
-                        driver.close()
-                        driver.switch_to.window(original_window)
-                    
-                    if driver.current_url != list_url:
-                        driver.get(list_url)
-                        time.sleep(3)
-                except:
-                    pass
-            
-            # Save article
             standardized_date = final_date.strftime("%Y-%m-%d %H:%M:%S")
-            date_source = "Article page" if extraction_successful else f"List page: {date_text}"
-
-            articles_found.append({
-                'title': final_title,
-                'link': article_link,
-                'summary': final_description,
-                'date': standardized_date,
-                'image_url': final_image,
-                'date_source': date_source
-            })
+            articles_found.append(
+                {
+                    "title": final_title,
+                    "link": article_link,
+                    "summary": final_description,
+                    "date": standardized_date,
+                    "image_url": final_image,
+                    "date_source": "Article page" if extraction_successful else f"List: {date_text}",
+                }
+            )
+            processed_urls.add(article_link)
             articles_in_range += 1
             consecutive_outside_range = 0
 
-            if extraction_successful:
-                print(f"     ✓ Article saved with full extracted content")
-            else:
-                print(f"     ✓ Article saved with list page data")
-        else:
-            article_date_str = article_date.strftime('%Y-%m-%d')
-            print(f"     [SKIP] Article outside date range: {article_date_str}")
-            articles_outside_range += 1
-            consecutive_outside_range += 1
-
-            days_before_range = (start_date - article_date.date()).days
-            if days_before_range > 2:
-                print(f"     Article is {days_before_range} days before target range - stopping")
-                break
-
-        if consecutive_outside_range >= max_consecutive_outside:
-            print(f"\n   Stopping: {max_consecutive_outside} consecutive articles outside date range")
-            break
-    
     print(f"\n   Page summary: {articles_in_range} in range, {articles_outside_range} outside range")
     return articles_found, articles_in_range, articles_outside_range
 
 
-def _thinakaran_http_get(url: str):
-    """curl_cffi first (GHA Cloudflare), then requests."""
-    import requests as req
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/rss+xml, application/xml, text/xml, */*",
-        "Accept-Language": "en-US,en;q=0.9,si;q=0.8",
-        "Referer": "https://www.thinakaran.lk/",
-    }
-    cf_import_error = None
-    for profile in ("chrome124", "chrome120", "safari17_0", "firefox133"):
-        try:
-            from curl_cffi import requests as cf_req  # type: ignore
-
-            r = cf_req.get(
-                url, impersonate=profile, timeout=25, headers=headers
-            )
-            if r.status_code == 200 and len(r.text) > 200:
-                print(f"[INFO] curl_cffi ({profile}) OK for {url}")
-                return r
-            print(f"[WARN] curl_cffi ({profile}) {r.status_code} for {url}")
-        except ImportError as e:
-            cf_import_error = e
-            break
-        except Exception as e:
-            print(f"[WARN] curl_cffi ({profile}): {e}")
-
-    if cf_import_error:
-        print(f"[WARN] curl_cffi not installed: {cf_import_error}")
-
-    try:
-        r = req.get(url, timeout=20, allow_redirects=True, headers=headers)
-        if r.status_code == 200 and len(r.text) > 200:
-            return r
-        print(f"[WARN] requests {r.status_code} for {url}")
-    except Exception as e:
-        print(f"[WARN] requests failed: {e}")
-    return None
-
-
-def _is_thinakaran_article_url(link: str) -> bool:
-    return bool(link and _THINAKARAN_ARTICLE_RE.search(link))
-
-
-def _html_to_plain(html: str) -> str:
-    if not html:
-        return ""
-    try:
-        return BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
-    except Exception:
-        return html.strip()
-
-
-def _parse_thinakaran_rss(xml_text: str) -> list[dict]:
-    import xml.etree.ElementTree as ET
-    from email.utils import parsedate_to_datetime
-
-    ns = {
-        "content": "http://purl.org/rss/1.0/modules/content/",
-        "dc": "http://purl.org/dc/elements/1.1/",
-        "media": "http://search.yahoo.com/mrss/",
-    }
-    articles: list[dict] = []
-    root = ET.fromstring(xml_text)
-    items = root.findall("./channel/item") or root.findall(".//item")
-    for item in items:
-        link = (item.findtext("link") or "").strip()
-        if not _is_thinakaran_article_url(link):
-            continue
-        title = (item.findtext("title") or "").strip()
-        pub_date = (item.findtext("pubDate") or "").strip()
-        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if pub_date:
-            try:
-                date_str = parsedate_to_datetime(pub_date).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-            except Exception:
-                pass
-
-        desc_html = (item.findtext("description") or "").strip()
-        content_el = item.find("content:encoded", ns)
-        content_html = (
-            (content_el.text or "").strip() if content_el is not None else ""
-        )
-        body_text = _html_to_plain(content_html) or _html_to_plain(desc_html)
-
-        image_url = ""
-        thumb = item.find("media:thumbnail", ns)
-        if thumb is not None and thumb.get("url"):
-            image_url = thumb.get("url", "").strip()
-        if not image_url:
-            for html in (content_html, desc_html):
-                if not html:
-                    continue
-                img = BeautifulSoup(html, "html.parser").find("img")
-                if img and img.get("src"):
-                    image_url = img["src"].strip()
-                    break
-
-        articles.append(
-            {
-                "title": title,
-                "link": link.split("?")[0],
-                "summary": body_text,
-                "description": body_text,
-                "date": date_str,
-                "image_url": image_url,
-                "date_source": f"RSS: {date_str}",
-            }
-        )
-    return articles
-
-
-def fetch_thinakaran_section_feed(section: str) -> list[dict]:
-    """Category RSS for incremental (bypasses Cloudflare on GHA)."""
-    feed_url = f"https://www.thinakaran.lk/category/{section}/feed/"
-    resp = _thinakaran_http_get(feed_url)
-    if not resp:
-        return []
-    if "just a moment" in resp.text.lower()[:8000]:
-        print(f"[WARN] Cloudflare interstitial on {feed_url}")
-        return []
-    try:
-        items = _parse_thinakaran_rss(resp.text)
-        if items:
-            print(f"[INFO] RSS {section}: {len(items)} article(s)")
-        return items
-    except Exception as e:
-        print(f"[WARN] RSS parse error ({section}): {e}")
-        return []
-
-
 def create_driver(headless=None):
-    """UC-first Chrome; headed under xvfb on GHA."""
-    import os
+    """Selenium fallback only when Scrapling fails."""
+    try:
+        import undetected_chromedriver as uc  # type: ignore
+
+        use_undetected = True
+    except Exception:
+        use_undetected = False
+
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
 
     if headless is None:
-        is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
-        has_display = bool(os.getenv("DISPLAY"))
-        headless = is_ci and not has_display
-        if is_ci and has_display:
-            print("[INFO] xvfb DISPLAY detected — using headed UC for Cloudflare")
+        headless = os.getenv("CI", "").lower() in ("1", "true", "yes")
 
     prefs = {"profile.default_content_setting_values": {"popups": 1}}
 
-    if USE_UNDETECTED:
-        print("[INFO] Using undetected-chromedriver...")
-
+    if use_undetected:
         def _uc_options():
             opts = uc.ChromeOptions()
             opts.page_load_strategy = "eager"
@@ -692,45 +205,29 @@ def create_driver(headless=None):
 
         try:
             driver = uc.Chrome(options=_uc_options(), use_subprocess=True)
-            print("[INFO] Undetected Chrome started successfully")
         except Exception as e:
-            error_msg = str(e)
-            print(f"[WARNING] UC initial attempt failed: {error_msg}")
-            match = re.search(r"Current browser version is (\d+)", error_msg)
-            if not match:
-                match = re.search(r"only supports Chrome version (\d+)", error_msg)
+            match = re.search(r"Current browser version is (\d+)", str(e)) or re.search(
+                r"only supports Chrome version (\d+)", str(e)
+            )
             if match:
-                major = int(match.group(1))
-                print(f"[INFO] Retrying UC with version_main={major}")
                 driver = uc.Chrome(
                     options=_uc_options(),
                     use_subprocess=True,
-                    version_main=major,
+                    version_main=int(match.group(1)),
                 )
             else:
                 raise
     else:
-        print("[WARNING] Falling back to regular Selenium (may be blocked)...")
         chrome_options = Options()
         chrome_options.page_load_strategy = "eager"
         if headless:
             chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option("useAutomationExtension", False)
-        chrome_options.add_argument(
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
         chrome_options.add_experimental_option("prefs", prefs)
         driver = webdriver.Chrome(
             service=Service(ChromeDriverManager().install()),
             options=chrome_options,
-        )
-        driver.execute_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
     driver.set_page_load_timeout(90 if headless else 60)
@@ -738,95 +235,47 @@ def create_driver(headless=None):
 
 
 def main(start_date=None, end_date=None):
-    """Main function."""
-    
     if not start_date or not end_date:
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=1)
         print(f"[DATE] No date range provided, using default: {start_date} to {end_date}")
     else:
         print(f"[DATE] Scraping articles from {start_date} to {end_date}")
-    
-    print(f"[INFO] Starting Thinakaran scraper (Local news)...")
-    driver = create_driver(headless=False)
 
-    categories = ["local", "politics", "features", "editorial", "sports", "business", "world"]
-    scraped_urls = set()
-    all_articles = []
-    total_articles_in_range = 0
-    total_articles_outside_range = 0
-    
+    print("[INFO] Starting Thinakaran scraper (Scrapling HTTP)...")
+
+    categories = list(THINAKARAN_SECTIONS) + ["world"]
+    scraped_urls: set[str] = set()
+    all_articles: list[dict] = []
+    total_in_range = 0
+
     for category in categories:
-        cat_url = f"https://www.thinakaran.lk/category/{category}/"
-        print(f"\n[INFO] === Processing category: {category} ({cat_url}) ===")
-        
+        cat_url = f"{BASE_URL}/category/{category}/"
+        print(f"\n[INFO] === Category: {category} ({cat_url}) ===")
         try:
-            articles, page_in_range, page_outside_range = process_articles_from_page(
-                driver, cat_url, start_date, end_date
+            articles, page_in_range, _ = process_articles_from_page(
+                cat_url, start_date, end_date, scraped_urls
             )
-            
-            # Filter out duplicates
-            unique_articles = []
-            for article in articles:
-                if article['link'] not in scraped_urls:
-                    unique_articles.append(article)
-                    scraped_urls.add(article['link'])
-            
-            all_articles.extend(unique_articles)
-            total_articles_in_range += len(unique_articles)
-            total_articles_outside_range += page_outside_range
-            print(f"[INFO] Category '{category}': Found {len(unique_articles)} unique articles in range")
+            all_articles.extend(articles)
+            total_in_range += page_in_range
+            print(f"[INFO] Category '{category}': {page_in_range} in range")
         except Exception as e:
-            print(f"  [ERROR] Error processing category {category}: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    print(f"\n[INFO] Closing browser...")
-    try:
-        driver.quit()
-        print(f"[INFO] Browser closed successfully")
-    except Exception as e:
-        print(f"[WARNING] Error closing browser: {e}")
-        try:
-            driver.close()
-        except:
-            pass
-    
-    print(f"\n[INFO] Final Results:")
-    print(f"  [INFO] Articles in date range: {total_articles_in_range}")
-    print(f"  [INFO] Articles outside range: {total_articles_outside_range}")
-    print(f"  [INFO] Total articles to save: {len(all_articles)}")
+            print(f"  [ERROR] Category {category}: {e}")
 
-    import os
-    os.makedirs('data', exist_ok=True)
-    
-    import os
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
-    data_dir = os.path.join(project_root, 'data')
+    data_dir = os.path.join(os.path.dirname(script_dir), "data")
     os.makedirs(data_dir, exist_ok=True)
-    json_filename = os.path.join(data_dir, 'thinakaran_latest_news.json')
+    json_filename = os.path.join(data_dir, "thinakaran_latest_news.json")
 
-    if not all_articles:
-        print(f" [INFO] 0 articles scraped. Preserving existing data in {json_filename} intact.")
+    if all_articles:
+        with open(json_filename, "w", encoding="utf-8") as f:
+            json.dump(all_articles, f, ensure_ascii=False, indent=2)
+        print(f"\n[INFO] Saved {len(all_articles)} articles to {json_filename}")
     else:
-        with open(json_filename, 'w', encoding='utf-8') as jsonfile:
-            json.dump(all_articles, jsonfile, ensure_ascii=False, indent=2)
+        print(f"\n[INFO] 0 articles — preserving existing {json_filename}")
 
-    if not all_articles:
-        print(f"[WARNING] No articles found in the specified date range ({start_date} to {end_date})")
-        print(f"[INFO] Saved empty JSON array to {json_filename}")
-    else:
-        print(f"\n[INFO] Scraping complete!")
-        print(f"[INFO] Saved {len(all_articles)} articles to {json_filename}")
-        print(f"[INFO] Date range: {start_date} to {end_date}")
-
-        articles_with_images = sum(1 for article in all_articles if article['image_url'] and article['image_url'] != '')
-        print(f"[IMAGE] Articles with images: {articles_with_images}/{len(all_articles)}")
 
 if __name__ == "__main__":
-    import os
-
     _scraper_dir = os.path.dirname(os.path.abspath(__file__))
     if _scraper_dir not in sys.path:
         sys.path.insert(0, _scraper_dir)
@@ -842,10 +291,8 @@ if __name__ == "__main__":
         try:
             start_date = datetime.strptime(sys.argv[1], "%Y-%m-%d").date()
             end_date = datetime.strptime(sys.argv[2], "%Y-%m-%d").date()
-            
             main(start_date, end_date)
         except ValueError as e:
-            print(f"[ERROR] Invalid date format. Use YYYY-MM-DD. Error: {e}")
-            print("[INFO] Example: python thinakaran_selenium_json.py 2026-02-09 2026-02-09")
+            print(f"[ERROR] Invalid date format: {e}")
     else:
         main()

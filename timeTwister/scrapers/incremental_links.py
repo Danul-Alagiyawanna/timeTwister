@@ -21,6 +21,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from thinakaran_scrapling import collect_category_links as _collect_thinakaran_links_scrapling
+
 
 def _navigate(driver: Any, url: str, wait_sec: float = 3.0) -> None:
     driver.get(url)
@@ -300,23 +302,6 @@ def _finalize_virakesari_links(raw_hrefs: list[str]) -> list[str]:
     return links
 
 
-def _log_virakesari_links(links: list[str], *, source: str, driver: Any | None = None) -> None:
-    if links:
-        ids = [virakesari_article_id(u) for u in links[:3]]
-        print(
-            f"[INFO] Virakesari main-grid ids (newest-first, {source}): "
-            f"{ids[0]}..{ids[-1]} ({len(links)} links)"
-        )
-        return
-    if driver is not None:
-        print(
-            f"[ERROR] Virakesari list empty — title={driver.title!r} "
-            f"src={len(driver.page_source or '')} bytes"
-        )
-    else:
-        print("[ERROR] Virakesari list empty — Scrapling returned no links")
-
-
 def _collect_virakesari_links_scrapling(url: str) -> list[str]:
     import os
 
@@ -347,6 +332,23 @@ def _collect_virakesari_links_scrapling(url: str) -> list[str]:
         if attempt < 3:
             time.sleep(6)
     return []
+
+
+def _log_virakesari_links(links: list[str], *, source: str, driver: Any | None = None) -> None:
+    if links:
+        ids = [virakesari_article_id(u) for u in links[:3]]
+        print(
+            f"[INFO] Virakesari main-grid ids (newest-first, {source}): "
+            f"{ids[0]}..{ids[-1]} ({len(links)} links)"
+        )
+        return
+    if driver is not None:
+        print(
+            f"[ERROR] Virakesari list empty — title={driver.title!r} "
+            f"src={len(driver.page_source or '')} bytes"
+        )
+    else:
+        print("[ERROR] Virakesari list empty — Scrapling returned no links")
 
 
 def collect_virakesari_links(driver: Any | None, url: str) -> list[str]:
@@ -460,9 +462,15 @@ def _thinakaran_page_ready(driver: Any) -> bool:
     return "penci-wrapper-data" in src or "penci-entry-title" in src
 
 
-def collect_thinakaran_links(driver: Any, url: str) -> list[str]:
-    """Thinakaran category feed — scroll + ul.penci-wrapper-data (matches main scraper)."""
+def collect_thinakaran_links(driver: Any | None, url: str) -> list[str]:
+    """Thinakaran category feed — Scrapling first, Selenium scroll fallback."""
     import os
+
+    links = _collect_thinakaran_links_scrapling(url)
+    if links:
+        return links
+    if driver is None:
+        return []
 
     is_ci = os.getenv("CI", "").lower() in ("1", "true", "yes")
     page_url = url.rstrip("/") + "/"
