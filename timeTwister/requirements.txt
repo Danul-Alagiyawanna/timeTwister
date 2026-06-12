@@ -9,3 +9,4 @@ requests>=2.31
 curl_cffi>=0.7
 scrapling[fetchers]>=0.4.9
 googlenewsdecoder>=0.1.7
+supabase>=2.0

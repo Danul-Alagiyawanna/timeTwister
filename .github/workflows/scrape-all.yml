@@ -221,3 +221,48 @@ jobs:
             echo "Push attempt $i failed, retrying in ${i}s..."
             sleep $i
           done
+
+  ingest-supabase:
+    name: Ingest GHA scrape batch to Supabase
+    needs: [prepare-matrix, scrape]
+    runs-on: ubuntu-latest
+    if: always() && needs.prepare-matrix.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: artifacts
+          pattern: data-*
+          merge-multiple: true
+
+      - name: Merge artifacts into timeTwister/data
+        run: |
+          mkdir -p timeTwister/data
+          find artifacts -type f -name '*.json' 2>/dev/null | while read -r f; do
+            cp -f "$f" "timeTwister/data/$(basename "$f")"
+          done
+          ls -la timeTwister/data/ || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: timeTwister/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r timeTwister/requirements.txt
+
+      - name: Ingest to Supabase (GHA outlets only)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            echo "::warning::SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — skipping ingest"
+            exit 0
+          fi
+          cd timeTwister
+          python pipeline/ingest_raw.py --gha-only
