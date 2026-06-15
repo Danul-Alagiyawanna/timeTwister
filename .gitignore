@@ -1,0 +1,10 @@
+.env
+.env.local
+credentials.json
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+localScrapers/data/
+localScrapers/__pycache__/
