@@ -263,12 +263,21 @@ def ingest(
             _finish_pipeline_run(client, run_id, articles_in=articles_in, articles_out=0)
         return 0
 
-    batch_size = 100
+    import time as _time
+    batch_size = 25
     upserted = 0
     for i in range(0, len(all_rows), batch_size):
         batch = all_rows[i : i + batch_size]
-        client.table("raw_articles").upsert(batch, on_conflict="url").execute()
-        upserted += len(batch)
+        for attempt in range(1, 4):
+            try:
+                client.table("raw_articles").upsert(batch, on_conflict="url").execute()
+                upserted += len(batch)
+                break
+            except Exception as _e:
+                if attempt == 3:
+                    raise
+                print(f"[WARN] Batch {i//batch_size+1} attempt {attempt} failed: {_e} — retrying...")
+                _time.sleep(2 ** attempt)
 
     print(f"[OK] Upserted {upserted} article(s) into raw_articles")
     if run_id:
